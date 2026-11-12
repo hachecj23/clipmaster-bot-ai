@@ -20,8 +20,11 @@ TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 MODELO = "gemini-3.8-flash"
+
 CANTIDAD_CLIPS = 3
-DURACION_CLIP = 45
+DURACION_MINIMA = 30
+DURACION_MAXIMA = 60
+DURACION_MAXIMA_VIDEO = 3600
 
 
 def ejecutar(command, timeout=1800):
@@ -34,40 +37,49 @@ def ejecutar(command, timeout=1800):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     await update.message.reply_text(
-        "🤖 CLIPMASTER AI\n\n"
+        "🤖 BIENVENIDO A CLIPMASTER AI\n\n"
         "Envíame un enlace público de YouTube.\n\n"
-        "🧠 Análisis inteligente con Gemini\n"
+        "🧠 Inteligencia artificial Gemini\n"
         "🎬 Detección de mejores momentos\n"
-        "📱 Clips verticales 9:16\n"
-        "🔥 3 clips de 45 segundos"
+        "🔥 3 clips automáticos\n"
+        "⏱️ Videos de hasta 60 minutos\n"
+        "📱 Formato vertical 9:16\n"
+        "🎞️ Clips de 30 a 60 segundos"
     )
 
 
 def analizar_video_gemini(url):
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = genai.Client(
+        api_key=GEMINI_API_KEY
+    )
 
     instrucciones = """
     Analiza el video completo de YouTube.
 
-    Tu objetivo es encontrar los 3 momentos más interesantes
-    para crear videos virales de TikTok, Facebook Reels y Shorts.
+    Encuentra los 3 momentos más interesantes para
+    TikTok, Instagram Reels y Facebook Reels.
 
-    Busca:
+    Prioriza:
     - Momentos sorprendentes.
-    - Conversaciones interesantes.
     - Escenas emocionantes.
+    - Conversaciones interesantes.
     - Frases impactantes.
-    - Momentos que despierten curiosidad.
-    - Historias con principio y final.
+    - Historias que despierten curiosidad.
+    - Momentos con potencial para captar la atención.
 
-    Cada fragmento debe durar aproximadamente 45 segundos.
+    REGLAS:
 
-    No selecciones los primeros segundos por defecto.
-    Busca momentos distribuidos por todo el video.
+    1. No selecciones solamente la introducción.
+    2. Busca momentos en diferentes partes del video.
+    3. Cada clip debe durar entre 30 y 60 segundos.
+    4. Los tiempos deben estar expresados en segundos.
+    5. No inventes marcas de tiempo.
+    6. Evita seleccionar momentos repetidos.
 
-    Devuelve EXCLUSIVAMENTE JSON con esta estructura:
+    Devuelve exclusivamente JSON con esta estructura:
 
     {
       "clips": [
@@ -75,25 +87,34 @@ def analizar_video_gemini(url):
           "inicio": 120,
           "fin": 165,
           "titulo": "Título atractivo",
-          "motivo": "Por qué es interesante"
+          "motivo": "Explicación del momento"
+        },
+        {
+          "inicio": 350,
+          "fin": 395,
+          "titulo": "Segundo momento",
+          "motivo": "Explicación"
+        },
+        {
+          "inicio": 700,
+          "fin": 745,
+          "titulo": "Tercer momento",
+          "motivo": "Explicación"
         }
       ]
     }
-
-    Los tiempos deben expresarse en segundos.
-    No inventes marcas de tiempo.
     """
 
     respuesta = client.interactions.create(
         model=MODELO,
         input=[
             {
-                "type": "video",
-                "uri": url
-            },
-            {
                 "type": "text",
                 "text": instrucciones
+            },
+            {
+                "type": "video",
+                "uri": url
             }
         ]
     )
@@ -108,30 +129,37 @@ def analizar_video_gemini(url):
 
     if not coincidencia:
         raise RuntimeError(
-            "Gemini no devolvió una selección válida."
+            "Gemini no devolvió una respuesta JSON válida."
         )
 
     datos = json.loads(coincidencia.group())
 
     clips = datos.get("clips", [])
 
-    if not clips:
-        raise RuntimeError("Gemini no encontró momentos.")
+    if len(clips) == 0:
+        raise RuntimeError(
+            "Gemini no encontró momentos interesantes."
+        )
 
     return clips[:CANTIDAD_CLIPS]
 
 
 async def descargar_video(url, folder):
 
-    patron = os.path.join(folder, "video.%(ext)s")
+    patron = os.path.join(
+        folder,
+        "video.%(ext)s"
+    )
 
     comando = [
         "yt-dlp",
         "--no-playlist",
         "--max-filesize", "2G",
-        "-f", "best[height<=720][ext=mp4]/best[height<=720]/best",
+        "-f",
+        "best[height<=720][ext=mp4]/best[height<=720]/best",
         "--merge-output-format", "mp4",
-        "-o", patron,
+        "-o",
+        patron,
         url
     ]
 
@@ -152,26 +180,64 @@ async def descargar_video(url, folder):
 
     if resultado.returncode != 0 or not archivos:
 
+        error = resultado.stderr[-1800:]
+
         raise RuntimeError(
-            "No se pudo obtener el video original.\n"
-            + resultado.stderr[-1200:]
+            "No se pudo descargar el video.\n" + error
         )
 
     return archivos[0]
 
 
+def obtener_duracion(video):
+
+    resultado = ejecutar([
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        video
+    ])
+
+    if resultado.returncode != 0:
+        raise RuntimeError(
+            "No se pudo obtener la duración del video."
+        )
+
+    return float(resultado.stdout.strip())
+
+
 async def crear_clips(update, video, momentos, folder):
+
+    duracion_video = await asyncio.to_thread(
+        obtener_duracion,
+        video
+    )
+
+    if duracion_video > DURACION_MAXIMA_VIDEO:
+        raise RuntimeError(
+            "El video supera el límite de una hora."
+        )
 
     enviados = 0
 
-    for numero, momento in enumerate(momentos, start=1):
+    for numero, momento in enumerate(
+        momentos,
+        start=1
+    ):
 
-        inicio = max(0, float(momento["inicio"]))
+        inicio = float(momento["inicio"])
         fin = float(momento["fin"])
 
         duracion = fin - inicio
 
-        if duracion < 20 or duracion > 90:
+        if duracion < DURACION_MINIMA:
+            continue
+
+        if duracion > DURACION_MAXIMA:
+            continue
+
+        if inicio < 0 or fin > duracion_video:
             continue
 
         clip = os.path.join(
@@ -180,7 +246,8 @@ async def crear_clips(update, video, momentos, folder):
         )
 
         comando = [
-            "ffmpeg", "-y",
+            "ffmpeg",
+            "-y",
             "-ss", str(inicio),
             "-i", video,
             "-t", str(duracion),
@@ -206,14 +273,18 @@ async def crear_clips(update, video, momentos, folder):
         )
 
         if resultado.returncode != 0:
+            await update.message.reply_text(
+                f"⚠️ Error creando el clip {numero}."
+            )
             continue
 
         if not os.path.exists(clip):
             continue
 
         if os.path.getsize(clip) > 45 * 1024 * 1024:
+
             await update.message.reply_text(
-                f"⚠️ El clip {numero} supera el límite de Telegram."
+                f"⚠️ El clip {numero} supera el límite permitido."
             )
             continue
 
@@ -222,21 +293,27 @@ async def crear_clips(update, video, momentos, folder):
             f"Mejor momento {numero}"
         )
 
+        motivo = momento.get(
+            "motivo",
+            ""
+        )
+
         with open(clip, "rb") as archivo:
 
             await update.message.reply_video(
                 video=archivo,
                 caption=(
-                    f"🔥 CLIPMASTER AI\n"
+                    f"🔥 CLIPMASTER AI\n\n"
                     f"🎬 {titulo}\n"
-                    f"📱 Formato 9:16"
+                    f"💡 {motivo}\n\n"
+                    f"📱 Formato vertical 9:16"
                 )
             )
 
         enviados += 1
 
     await update.message.reply_text(
-        f"✅ PROCESAMIENTO TERMINADO\n"
+        f"✅ PROCESAMIENTO TERMINADO\n\n"
         f"Clips enviados: {enviados}/{CANTIDAD_CLIPS}"
     )
 
@@ -245,5 +322,86 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     url = update.message.text.strip()
 
-    if not re.match(
-        r"https?://(www\.)?(youtube\.com|youtu
+    patron_youtube = (
+        r"https?://(www\.)?"
+        r"(youtube\.com|youtu\.be)/"
+    )
+
+    if not re.match(patron_youtube, url):
+
+        await update.message.reply_text(
+            "❌ Envíame un enlace válido de YouTube."
+        )
+        return
+
+    await update.message.reply_text(
+        "🧠 GEMINI ESTÁ ANALIZANDO EL VIDEO...\n\n"
+        "Buscando los mejores momentos."
+    )
+
+    try:
+
+        momentos = await asyncio.to_thread(
+            analizar_video_gemini,
+            url
+        )
+
+        await update.message.reply_text(
+            "🔥 Gemini encontró los momentos.\n\n"
+            "Ahora estoy preparando los clips..."
+        )
+
+        with tempfile.TemporaryDirectory() as folder:
+
+            video = await descargar_video(
+                url,
+                folder
+            )
+
+            await crear_clips(
+                update,
+                video,
+                momentos,
+                folder
+            )
+
+    except Exception as error:
+
+        await update.message.reply_text(
+            "⚠️ ERROR DE PROCESAMIENTO:\n\n"
+            + str(error)[:2500]
+        )
+
+
+def main():
+
+    if not TOKEN:
+        raise RuntimeError(
+            "Falta configurar BOT_TOKEN."
+        )
+
+    if not GEMINI_API_KEY:
+        raise RuntimeError(
+            "Falta configurar GEMINI_API_KEY."
+        )
+
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(
+        CommandHandler("start", start)
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            process_video
+        )
+    )
+
+    print("CLIPMASTER AI CON GEMINI INICIADO")
+
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
