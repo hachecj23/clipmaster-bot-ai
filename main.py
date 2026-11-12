@@ -156,7 +156,9 @@ Devuelve exclusivamente JSON válido:
             },
             {
                 "type": "video",
-                "uri": url
+                "uri": url,
+                "processing": "static",
+                "resolution": "low"
             }
         ]
     )
@@ -475,7 +477,7 @@ async def process_video(
                 analizar_video_gemini,
                 url
             ),
-            timeout=600
+            timeout=1800
         )
 
         await mensaje.edit_text(
