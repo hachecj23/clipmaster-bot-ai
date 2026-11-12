@@ -14,8 +14,6 @@ COPY requirements.txt .
 
 RUN pip install -r requirements.txt
 
-RUN yt-dlp –version && deno –version
-
 COPY . .
 
 CMD [“python”, “main.py”]
