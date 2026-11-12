@@ -113,8 +113,13 @@ def analizar_video_gemini(url):
                 "text": instrucciones
             },
             {
+            {
                 "type": "video",
-                "uri": url
+                "uri": url,
+                "processing": "static",
+                "resolution": "low"
+            }
+            
             }
         ]
     )
