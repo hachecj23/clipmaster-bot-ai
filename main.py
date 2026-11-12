@@ -63,12 +63,12 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             if result.returncode != 0 or not os.path.exists(output):
+                error = result.stderr[-2500:] if result.stderr else "Error desconocido"
+
                 await update.message.reply_text(
-                    "❌ No se pudo descargar el video. "
-                    "Comprueba el enlace y tus permisos."
+                    "❌ ERROR DE DESCARGA:\n\n" + error[:3500]
                 )
                 return
-
             await update.message.reply_text(
                 "🎬 Video recibido. Creando clips..."
             )
