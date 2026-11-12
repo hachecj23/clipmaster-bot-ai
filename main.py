@@ -1,5 +1,6 @@
 import os
 import re
+import glob
 import asyncio
 import tempfile
 import subprocess
@@ -15,16 +16,61 @@ from telegram.ext import (
 
 TOKEN = os.getenv("BOT_TOKEN")
 
+DURACION_CLIP = 50
+CANTIDAD_CLIPS = 6
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 BIENVENIDO A CLIPMASTER AI\n\n"
-        "Envíame un enlace de YouTube para comenzar.\n\n"
-        "🎬 Clips automáticos\n"
-        "📱 Formato vertical\n"
-        "⏱️ Clips de 30, 60 y 90 segundos\n"
-        "📝 Próximamente: subtítulos inteligentes."
+        "Envíame un enlace de YouTube.\n\n"
+        "🎬 3 clips automáticos\n"
+        "📱 Formato vertical 9:16\n"
+        "⏱️ 30 segundos cada clip\n"
+        "🔥 Clips de diferentes partes del video."
     )
+
+
+def ejecutar_comando(command, timeout=1800):
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=timeout
+    )
+
+
+def obtener_duracion(video):
+    resultado = ejecutar_comando([
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        video
+    ])
+
+    if resultado.returncode != 0:
+        raise RuntimeError("No se pudo calcular la duración del video.")
+
+    return float(resultado.stdout.strip())
+
+
+def calcular_momentos(duracion):
+    if duracion < DURACION_CLIP:
+        raise RuntimeError(
+            "El video debe durar al menos 30 segundos."
+        )
+
+    max_inicio = duracion - DURACION_CLIP
+
+    porcentajes = [0.15, 0.45, 0.75]
+
+    momentos = [
+        min(max_inicio, max_inicio * porcentaje)
+        for porcentaje in porcentajes
+    ]
+
+    return momentos
 
 
 async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -36,103 +82,140 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "⏳ Recibí tu enlace. Preparando el video..."
+        "⏳ Recibí tu enlace. Descargando el video completo..."
     )
 
     with tempfile.TemporaryDirectory() as folder:
 
-        output = os.path.join(folder, "video.mp4")
-
         try:
+            patron = os.path.join(folder, "video.%(ext)s")
+
             command = [
                 "yt-dlp",
                 "--no-playlist",
                 "--max-filesize", "500M",
-                "-f", "best[height<=720][ext=mp4]/best[height<=720]",
+                "-f", "best[height<=720][ext=mp4]/best[height<=720]/best",
                 "--merge-output-format", "mp4",
-                "-o", output,
+                "-o", patron,
                 url
             ]
 
-            result = await asyncio.to_thread(
-                subprocess.run,
+            resultado = await asyncio.to_thread(
+                ejecutar_comando,
                 command,
-                capture_output=True,
-                text=True,
-                timeout=1800
+                1800
             )
 
-            if result.returncode != 0 or not os.path.exists(output):
-                error = result.stderr[-2500:] if result.stderr else "Error desconocido"
+            archivos = glob.glob(os.path.join(folder, "video.*"))
 
-                await update.message.reply_text(
-                    "❌ ERROR DE DESCARGA:\n\n" + error[:3500]
-                )
-                return
-            await update.message.reply_text(
-                "🎬 Video recibido. Creando clips..."
-            )
-
-            clip = os.path.join(folder, "clip.mp4")
-
-            ffmpeg = [
-                "ffmpeg", "-y",
-                "-ss", "0",
-                "-i", output,
-                "-t", "45",
-                "-vf",
-                "scale=720:1280:force_original_aspect_ratio=increase,"
-                "crop=720:1280",
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-crf", "28",
-                "-c:a", "aac",
-                "-b:a", "96k",
-                "-movflags", "+faststart",
-                clip
+            archivos = [
+                archivo for archivo in archivos
+                if not archivo.endswith((".part", ".ytdl"))
             ]
 
-            process = await asyncio.to_thread(
-                subprocess.run,
-                ffmpeg,
-                capture_output=True,
-                text=True,
-                timeout=600
+            if resultado.returncode != 0 or not archivos:
+                error = resultado.stderr[-2000:]
+
+                await update.message.reply_text(
+                    "❌ ERROR DE DESCARGA:\n\n" + error[:3000]
+                )
+                return
+
+            video = archivos[0]
+
+            duracion = await asyncio.to_thread(
+                obtener_duracion,
+                video
             )
 
-            if process.returncode != 0 or not os.path.exists(clip):
-                await update.message.reply_text(
-                    "❌ Error al crear el clip."
-                )
-                return
+            momentos = calcular_momentos(duracion)
 
-            if os.path.getsize(clip) > 45 * 1024 * 1024:
-                await update.message.reply_text(
-                    "❌ El clip supera el tamaño permitido."
-                )
-                return
+            await update.message.reply_text(
+                f"🎬 Video descargado.\n"
+                f"⏱️ Duración: {int(duracion // 60)} minutos.\n"
+                f"🔥 Preparando {CANTIDAD_CLIPS} clips..."
+            )
 
-            with open(clip, "rb") as video:
-                await update.message.reply_video(
-                    video=video,
-                    caption="🔥 CLIPMASTER AI | Clip vertical"
+            for numero, inicio in enumerate(momentos, start=1):
+
+                clip = os.path.join(
+                    folder,
+                    f"clip_{numero}.mp4"
                 )
+
+                ffmpeg = [
+                    "ffmpeg", "-y",
+                    "-ss", str(inicio),
+                    "-i", video,
+                    "-t", str(DURACION_CLIP),
+                    "-map", "0:v:0",
+                    "-map", "0:a?",
+                    "-vf",
+                    "scale=720:1280:force_original_aspect_ratio=increase,"
+                    "crop=720:1280",
+                    "-c:v", "libx264",
+                    "-preset", "veryfast",
+                    "-crf", "28",
+                    "-c:a", "aac",
+                    "-b:a", "96k",
+                    "-threads", "2",
+                    "-movflags", "+faststart",
+                    clip
+                ]
+
+                proceso = await asyncio.to_thread(
+                    ejecutar_comando,
+                    ffmpeg,
+                    600
+                )
+
+                if proceso.returncode != 0 or not os.path.exists(clip):
+                    await update.message.reply_text(
+                        f"⚠️ No se pudo crear el clip {numero}."
+                    )
+                    continue
+
+                if os.path.getsize(clip) > 45 * 1024 * 1024:
+                    await update.message.reply_text(
+                        f"⚠️ El clip {numero} supera el tamaño permitido."
+                    )
+                    continue
+
+                with open(clip, "rb") as archivo:
+                    await update.message.reply_video(
+                        video=archivo,
+                        caption=(
+                            f"🔥 CLIPMASTER AI\n"
+                            f"🎬 Clip {numero} de {CANTIDAD_CLIPS}\n"
+                            f"📱 Formato vertical 9:16"
+                        )
+                    )
+
+            await update.message.reply_text(
+                "✅ ¡Procesamiento terminado!"
+            )
 
         except Exception as error:
+
             await update.message.reply_text(
-                f"⚠️ Error procesando el video: {str(error)[:300]}"
+                f"⚠️ Error procesando el video:\n{str(error)[:500]}"
             )
 
 
 def main():
+
     if not TOKEN:
         raise RuntimeError("Falta configurar BOT_TOKEN")
 
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+
     app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, process_video)
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            process_video
+        )
     )
 
     print("CLIPMASTER AI iniciado")
