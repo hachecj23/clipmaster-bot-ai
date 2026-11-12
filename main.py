@@ -7,7 +7,8 @@ import asyncio
 import tempfile
 import subprocess
 import traceback
-from google import genai
+from twelvelabs import TwelveLabs
+from twelvelabs.types import VideoContext_AssetId
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -20,13 +21,26 @@ from telegram.ext import (
 # CONFIGURACIÓN
 # ==================================================
 TOKEN = os.getenv("BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MODELO = "gemini-3.8-flash"
+TWELVELABS_API_KEY = os.getenv("TWELVELABS_API_KEY")
+MODELO = "pegasus1.6"
 CANTIDAD_CLIPS = 3
 DURACION_MINIMA = 30
 DURACION_MAXIMA = 60
 DURACION_MAXIMA_VIDEO = 3600
 TAMANO_MAXIMO_CLIP = 45 * 1024 * 1024
+MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024
+TIEMPO_MAXIMO_ANALISIS = 3600
+# ==================================================
+# CLIENTE TWELVELABS
+# ==================================================
+def crear_cliente():
+    if not TWELVELABS_API_KEY:
+        raise RuntimeError(
+            "Falta configurar TWELVELABS_API_KEY en Railway."
+        )
+    return TwelveLabs(
+        api_key=TWELVELABS_API_KEY
+    )
 # ==================================================
 # EJECUTAR COMANDOS
 # ==================================================
@@ -50,190 +64,34 @@ def validar_youtube(url):
 # ==================================================
 # COMANDO START
 # ==================================================
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 BIENVENIDO A CLIPMASTER AI\n\n"
         "Envíame un enlace público de YouTube.\n\n"
-        "🧠 Inteligencia artificial Gemini\n"
-        "🎬 Selección automática de momentos\n"
+        "🧠 Inteligencia artificial TwelveLabs\n"
+        "🎬 Modelo Pegasus 1.6\n"
         "🔥 3 clips automáticos\n"
         "⏱️ Videos de hasta 60 minutos\n"
         "📱 Formato vertical 9:16\n"
         "🎞️ Clips de 30 a 60 segundos"
     )
 # ==================================================
-# ANALIZAR VIDEO CON GEMINI
+# OBTENER DURACIÓN
 # ==================================================
-def analizar_video_gemini(url):
-    client = genai.Client(
-        api_key=GEMINI_API_KEY
-    )
-    instrucciones = """
-Analiza el contenido del video completo de YouTube.
-Encuentra los tres mejores momentos para crear
-videos atractivos para TikTok, Instagram Reels
-y Facebook Reels.
-Busca:
-- Momentos sorprendentes.
-- Escenas emocionantes.
-- Conversaciones interesantes.
-- Frases impactantes.
-- Historias que despierten curiosidad.
-- Momentos con potencial para captar la atención.
-REGLAS:
-1. Busca momentos en diferentes partes del video.
-2. No selecciones solamente la introducción.
-3. Cada clip debe durar entre 30 y 60 segundos.
-4. Los tiempos deben expresarse en segundos.
-5. No inventes marcas de tiempo.
-6. Evita seleccionar momentos repetidos.
-7. Los tiempos deben corresponder al video real.
-Devuelve exclusivamente JSON válido:
-{
-  "clips": [
-    {
-      "inicio": 120,
-      "fin": 165,
-      "titulo": "Título atractivo",
-      "motivo": "Explicación del momento"
-    },
-    {
-      "inicio": 350,
-      "fin": 395,
-      "titulo": "Segundo momento",
-      "motivo": "Explicación del momento"
-    },
-    {
-      "inicio": 700,
-      "fin": 745,
-      "titulo": "Tercer momento",
-      "motivo": "Explicación del momento"
-    }
-  ]
-}
-"""
-    respuesta = None
-    # REINTENTOS AUTOMÁTICOS
-    for intento in range(1, 4):
-        try:
-            print(
-                f"Gemini: intento {intento} de 3",
-                flush=True
-            )
-            respuesta = client.interactions.create(
-                model=MODELO,
-                input=[
-                    {
-                        "type": "text",
-                        "text": instrucciones
-                    },
-                    {
-                        "type": "video",
-                        "uri": url,
-                        "processing": "static",
-                        "resolution": "low"
-                    }
-                ]
-            )
-            break
-        except Exception as error:
-            error_texto = str(error).lower()
-            codigo = getattr(
-                error,
-                "code",
-                None
-            )
-            codigo_http = getattr(
-                error,
-                "status_code",
-                None
-            )
-            error_temporal = (
-                codigo in (429, 500, 502, 503, 504)
-                or codigo_http in (429, 500, 502, 503, 504)
-                or any(
-                    palabra in error_texto
-                    for palabra in [
-                        "503",
-                        "429",
-                        "high demand",
-                        "service_unavailable",
-                        "temporarily unavailable",
-                        "internal server error",
-                        "resource exhausted"
-                    ]
-                )
-            )
-            if not error_temporal or intento == 3:
-                raise
-            espera = intento * 20
-            print(
-                f"Gemini no está disponible. "
-                f"Reintentando en {espera} segundos.",
-                flush=True
-            )
-            time.sleep(espera)
-    if respuesta is None:
+def obtener_duracion(video):
+    resultado = ejecutar([
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        video
+    ])
+    if resultado.returncode != 0:
         raise RuntimeError(
-            "Gemini no pudo completar el análisis."
+            "No se pudo obtener la duración del video."
         )
-    texto = respuesta.output_text
-    if not texto:
-        raise RuntimeError(
-            "Gemini no devolvió contenido."
-        )
-    # LIMPIAR MARKDOWN
-    texto = texto.strip()
-    texto = re.sub(
-        r"^```(?:json)?\s*",
-        "",
-        texto
-    )
-    texto = re.sub(
-        r"\s*```$",
-        "",
-        texto
-    )
-    datos = json.loads(texto)
-    clips = datos.get("clips", [])
-    if not isinstance(clips, list):
-        raise RuntimeError(
-            "Gemini devolvió una lista inválida."
-        )
-    clips_validos = []
-    for clip in clips:
-        if not isinstance(clip, dict):
-            continue
-        try:
-            inicio = float(clip["inicio"])
-            fin = float(clip["fin"])
-            duracion = fin - inicio
-            if inicio < 0:
-                continue
-            if DURACION_MINIMA <= duracion <= DURACION_MAXIMA:
-                clips_validos.append({
-                    "inicio": inicio,
-                    "fin": fin,
-                    "titulo": str(
-                        clip.get(
-                            "titulo",
-                            "Mejor momento"
-                        )
-                    ),
-                    "motivo": str(
-                        clip.get("motivo", "")
-                    )
-                })
-        except (KeyError, TypeError, ValueError):
-            continue
-    if not clips_validos:
-        raise RuntimeError(
-            "Gemini no encontró momentos válidos."
-        )
-    return clips_validos[:CANTIDAD_CLIPS]
+    return float(resultado.stdout.strip())
 # ==================================================
 # DESCARGAR VIDEO
 # ==================================================
@@ -269,30 +127,222 @@ async def descargar_video(url, folder):
         )
     ]
     if resultado.returncode != 0 or not archivos:
-        error = resultado.stderr[-1800:]
         raise RuntimeError(
-            "No se pudo descargar el video:\n" + error
+            "No se pudo descargar el video:\n"
+            + resultado.stderr[-1500:]
         )
-    return archivos[0]
-# ==================================================
-# OBTENER DURACIÓN
-# ==================================================
-def obtener_duracion(video):
-    resultado = ejecutar([
-        "ffprobe",
-        "-v", "error",
-        "-show_entries", "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
+    video = archivos[0]
+    tamano = os.path.getsize(video)
+    if tamano > MAX_VIDEO_BYTES:
+        raise RuntimeError(
+            "El video supera el límite temporal "
+            "de 2 GB configurado para Railway."
+        )
+    duracion = await asyncio.to_thread(
+        obtener_duracion,
         video
-    ])
-    if resultado.returncode != 0:
-        raise RuntimeError(
-            "No se pudo obtener la duración del video."
-        )
-    return float(
-        resultado.stdout.strip()
     )
+    if duracion > DURACION_MAXIMA_VIDEO:
+        raise RuntimeError(
+            "El video supera el límite de 60 minutos."
+        )
+    return video
+# ==================================================
+# SUBIR VIDEO A TWELVELABS
+# ==================================================
+def subir_video_twelvelabs(video):
+    client = crear_cliente()
+    print(
+        "Iniciando carga multipart a TwelveLabs...",
+        flush=True
+    )
+    resultado = client.multipart_upload.upload_file(
+        file_path=video,
+        filename=os.path.basename(video),
+        file_type="video",
+        batch_size=5,
+        max_workers=2,
+        max_retries=3,
+        retry_delay=2.0
+    )
+    asset_id = resultado.asset_id
+    if not asset_id:
+        raise RuntimeError(
+            "TwelveLabs no devolvió el identificador del video."
+        )
+    print(
+        f"Video subido. Asset ID: {asset_id}",
+        flush=True
+    )
+    # Esperar a que TwelveLabs termine de procesar
+    # el archivo subido.
+    inicio = time.time()
+    while True:
+        asset = client.assets.retrieve(asset_id)
+        estado = str(asset.status).lower()
+        print(
+            f"Estado del archivo: {estado}",
+            flush=True
+        )
+        if estado == "ready":
+            return asset_id
+        if estado == "failed":
+            raise RuntimeError(
+                "TwelveLabs no pudo procesar el archivo."
+            )
+        if time.time() - inicio > 1800:
+            raise TimeoutError(
+                "La preparación del video tardó demasiado."
+            )
+        time.sleep(5)
+# ==================================================
+# ANALIZAR CON PEGASUS 1.6
+# ==================================================
+def analizar_video_twelvelabs(asset_id):
+    client = crear_cliente()
+    instrucciones = """
+Analiza el video completo y encuentra los TRES mejores
+momentos para crear clips virales de TikTok,
+Instagram Reels y Facebook Reels.
+Busca:
+- Momentos sorprendentes.
+- Escenas emocionantes.
+- Conversaciones interesantes.
+- Frases impactantes.
+- Historias que despierten curiosidad.
+- Momentos con potencial para captar la atención.
+REGLAS:
+1. Selecciona momentos de diferentes partes del video.
+2. Evita seleccionar momentos repetidos.
+3. Cada momento debe durar entre 30 y 60 segundos.
+4. Devuelve los tiempos en segundos.
+5. No inventes marcas de tiempo.
+6. Los tiempos deben corresponder al video real.
+7. Prioriza los momentos que puedan captar la atención
+   durante los primeros segundos.
+Devuelve exclusivamente JSON válido con esta estructura:
+{
+  "clips": [
+    {
+      "inicio": 120,
+      "fin": 165,
+      "titulo": "Título atractivo",
+      "motivo": "Explicación del momento"
+    },
+    {
+      "inicio": 350,
+      "fin": 395,
+      "titulo": "Segundo momento",
+      "motivo": "Explicación del momento"
+    },
+    {
+      "inicio": 700,
+      "fin": 745,
+      "titulo": "Tercer momento",
+      "motivo": "Explicación del momento"
+    }
+  ]
+}
+"""
+    print(
+        "Enviando video a Pegasus 1.6...",
+        flush=True
+    )
+    tarea = client.analyze_async.tasks.create(
+        model_name=MODELO,
+        video=VideoContext_AssetId(
+            asset_id=asset_id
+        ),
+        prompt=instrucciones,
+        max_tokens=4096
+    )
+    task_id = tarea.task_id
+    print(
+        f"Análisis iniciado. Task ID: {task_id}",
+        flush=True
+    )
+    inicio_espera = time.time()
+    while True:
+        resultado = client.analyze_async.tasks.retrieve(
+            task_id
+        )
+        estado = str(resultado.status).lower()
+        print(
+            f"Estado del análisis Pegasus: {estado}",
+            flush=True
+        )
+        if estado == "ready":
+            if not resultado.result or not resultado.result.data:
+                raise RuntimeError(
+                    "Pegasus terminó sin devolver resultados."
+                )
+            return resultado.result.data
+        if estado in ("failed", "canceled"):
+            error = getattr(
+                resultado,
+                "error",
+                None
+            )
+            raise RuntimeError(
+                f"Análisis fallido: {error}"
+            )
+        if time.time() - inicio_espera > TIEMPO_MAXIMO_ANALISIS:
+            raise TimeoutError(
+                "Pegasus superó el tiempo máximo de análisis."
+            )
+        time.sleep(10)
+# ==================================================
+# VALIDAR RESULTADOS
+# ==================================================
+def validar_resultados(texto):
+    texto = texto.strip()
+    texto = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        texto
+    )
+    texto = re.sub(
+        r"\s*```$",
+        "",
+        texto
+    )
+    datos = json.loads(texto)
+    clips = datos.get("clips", [])
+    if not isinstance(clips, list):
+        raise RuntimeError(
+            "Pegasus devolvió una lista inválida."
+        )
+    clips_validos = []
+    for clip in clips:
+        if not isinstance(clip, dict):
+            continue
+        try:
+            inicio = float(clip["inicio"])
+            fin = float(clip["fin"])
+            duracion = fin - inicio
+            if inicio < 0:
+                continue
+            if DURACION_MINIMA <= duracion <= DURACION_MAXIMA:
+                clips_validos.append({
+                    "inicio": inicio,
+                    "fin": fin,
+                    "titulo": str(
+                        clip.get(
+                            "titulo",
+                            "Mejor momento"
+                        )
+                    ),
+                    "motivo": str(
+                        clip.get("motivo", "")
+                    )
+                })
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not clips_validos:
+        raise RuntimeError(
+            "Pegasus no encontró momentos válidos."
+        )
+    return clips_validos[:CANTIDAD_CLIPS]
 # ==================================================
 # CREAR CLIPS
 # ==================================================
@@ -306,10 +356,6 @@ async def crear_clips(
         obtener_duracion,
         video
     )
-    if duracion_video > DURACION_MAXIMA_VIDEO:
-        raise RuntimeError(
-            "El video supera el límite de 60 minutos."
-        )
     enviados = 0
     for numero, momento in enumerate(
         momentos,
@@ -401,29 +447,44 @@ async def process_video(
         )
         return
     mensaje = await update.message.reply_text(
-        "🧠 GEMINI ESTÁ ANALIZANDO EL VIDEO...\n\n"
-        "Buscando los mejores momentos.\n\n"
-        "Si los servidores están ocupados, "
-        "intentaré nuevamente automáticamente."
+        "📥 RECIBÍ TU VIDEO.\n\n"
+        "Preparando descarga..."
     )
     try:
-        # ANALIZAR VIDEO
-        momentos = await asyncio.wait_for(
-            asyncio.to_thread(
-                analizar_video_gemini,
-                url
-            ),
-            timeout=1800
-        )
-        await mensaje.edit_text(
-            "🔥 GEMINI ENCONTRÓ LOS MOMENTOS.\n\n"
-            "Ahora estoy preparando los clips..."
-        )
-        # DESCARGAR Y CREAR CLIPS
         with tempfile.TemporaryDirectory() as folder:
+            # DESCARGAR
+            await mensaje.edit_text(
+                "📥 DESCARGANDO VIDEO DE YOUTUBE..."
+            )
             video = await descargar_video(
                 url,
                 folder
+            )
+            # SUBIR A TWELVELABS
+            await mensaje.edit_text(
+                "☁️ SUBIENDO VIDEO A TWELVELABS...\n\n"
+                "Esto puede tardar dependiendo del tamaño."
+            )
+            asset_id = await asyncio.to_thread(
+                subir_video_twelvelabs,
+                video
+            )
+            # ANALIZAR
+            await mensaje.edit_text(
+                "🧠 PEGASUS 1.6 ESTÁ ANALIZANDO EL VIDEO...\n\n"
+                "Buscando los tres mejores momentos."
+            )
+            texto = await asyncio.to_thread(
+                analizar_video_twelvelabs,
+                asset_id
+            )
+            momentos = validar_resultados(
+                texto
+            )
+            # CREAR CLIPS
+            await mensaje.edit_text(
+                "🔥 PEGASUS ENCONTRÓ LOS MOMENTOS.\n\n"
+                "Preparando tus clips verticales..."
             )
             await crear_clips(
                 update,
@@ -431,10 +492,13 @@ async def process_video(
                 momentos,
                 folder
             )
-    except asyncio.TimeoutError:
+            await mensaje.edit_text(
+                "✅ CLIPMASTER AI TERMINÓ EL TRABAJO."
+            )
+    except TimeoutError as error:
         await update.message.reply_text(
-            "⏱️ El análisis tardó demasiado.\n\n"
-            "Inténtalo nuevamente más tarde."
+            "⏱️ EL PROCESAMIENTO TARDÓ DEMASIADO.\n\n"
+            f"{str(error)}"
         )
     except Exception as error:
         print(
@@ -455,9 +519,9 @@ def main():
         raise RuntimeError(
             "Falta configurar BOT_TOKEN en Railway."
         )
-    if not GEMINI_API_KEY:
+    if not TWELVELABS_API_KEY:
         raise RuntimeError(
-            "Falta configurar GEMINI_API_KEY en Railway."
+            "Falta configurar TWELVELABS_API_KEY en Railway."
         )
     app = Application.builder().token(TOKEN).build()
     app.add_handler(
@@ -470,7 +534,7 @@ def main():
         )
     )
     print(
-        "CLIPMASTER AI CON GEMINI INICIADO",
+        "CLIPMASTER AI CON TWELVELABS PEGASUS 1.6 INICIADO",
         flush=True
     )
     app.run_polling()
