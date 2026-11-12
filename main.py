@@ -5,6 +5,7 @@ import glob
 import asyncio
 import tempfile
 import subprocess
+import traceback
 
 from google import genai
 from telegram import Update
@@ -370,11 +371,11 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 folder
             )
 
-    except Exception as error:
-
-        await update.message.reply_text(
+    except Exception as traceback.print_exc(
+        await update.message.reply_text()
+        
             "⚠️ ERROR DE PROCESAMIENTO:\n\n"
-            + str(error)[:2500]
+            + traceback.format_exc()[-3000:]
         )
 
 
