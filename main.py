@@ -3,658 +3,465 @@ import re
 import json
 import glob
 import time
+import shutil
 import asyncio
 import tempfile
 import subprocess
-import traceback
+import logging
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 
+from telegram import Update
+from telegram.constants import ChatAction
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 from twelvelabs import TwelveLabs
 from twelvelabs.types import VideoContext_AssetId
 
-from telegram import Update
-from telegram.ext import (
-Application,
-CommandHandler,
-MessageHandler,
-ContextTypes,
-filters
-)
+# ============================================================
+# CLIPMASTER AI - Telegram bot para Railway
+# Variables requeridas: BOT_TOKEN, TWELVELABS_API_KEY
+# Variable opcional: BGUTIL_POT_URL
+# ============================================================
 
-==================================================
-
-CONFIGURACIÓN
-
-==================================================
-
-TOKEN = os.getenv(“BOT_TOKEN”)
-TWELVELABS_API_KEY = os.getenv(“TWELVELABS_API_KEY”)
-
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TWELVELABS_API_KEY = os.getenv("TWELVELABS_API_KEY", "").strip()
 BGUTIL_POT_URL = os.getenv(
-“BGUTIL_POT_URL”,
-“http://bgutil-ytdlp-pot-provider.railway.internal:4416”
-)
+    "BGUTIL_POT_URL",
+    "http://bgutil-ytdlp-pot-provider.railway.internal:4416",
+).strip()
 
-MODELO = “pegasus1.6”
-
+MODELO = "pegasus1.6"
 CANTIDAD_CLIPS = 3
-
 DURACION_MINIMA = 30
 DURACION_MAXIMA = 60
-
 DURACION_MAXIMA_VIDEO = 3600
-
-TAMANO_MAXIMO_CLIP = 45 * 1024 * 1024
-
 MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024
-
+TAMANO_MAXIMO_CLIP = 45 * 1024 * 1024
+TIEMPO_MAXIMO_DESCARGA = 1800
 TIEMPO_MAXIMO_ANALISIS = 3600
 
-==================================================
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("clipmaster")
 
-CLIENTE TWELVELABS
+cliente_twelvelabs = None
 
-==================================================
 
-def crear_cliente():
+def obtener_cliente():
+    global cliente_twelvelabs
+    if cliente_twelvelabs is None:
+        if not TWELVELABS_API_KEY:
+            raise RuntimeError("Falta configurar TWELVELABS_API_KEY en Railway.")
+        cliente_twelvelabs = TwelveLabs(api_key=TWELVELABS_API_KEY)
+    return cliente_twelvelabs
 
-if not TWELVELABS_API_KEY:
-    raise RuntimeError(
-        "Falta configurar TWELVELABS_API_KEY en Railway."
+
+def ejecutar_comando(comando, timeout):
+    proceso = subprocess.run(
+        comando,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
     )
-return TwelveLabs(
-    api_key=TWELVELABS_API_KEY
-)
+    if proceso.returncode != 0:
+        detalle = (proceso.stderr or proceso.stdout or "Error sin detalle")[-3500:]
+        raise RuntimeError(detalle)
+    return proceso.stdout
 
-==================================================
-
-EJECUTAR COMANDOS
-
-==================================================
-
-def ejecutar(comando, timeout=1800):
-
-return subprocess.run(
-    comando,
-    capture_output=True,
-    text=True,
-    timeout=timeout
-)
-
-==================================================
-
-VALIDAR ENLACES
-
-==================================================
 
 def validar_youtube(url):
-
-patron = (
-    r"^https?://"
-    r"(www\.)?"
-    r"(youtube\.com|youtu\.be)/"
-)
-return re.match(patron, url) is not None
-
-==================================================
-
-COMANDO START
-
-==================================================
-
-async def start(
-update: Update,
-context: ContextTypes.DEFAULT_TYPE
-):
-
-await update.message.reply_text(
-    "🤖 BIENVENIDO A CLIPMASTER AI\n\n"
-    "Envíame un enlace público de YouTube.\n\n"
-    "🧠 Inteligencia artificial TwelveLabs\n"
-    "🎬 Modelo Pegasus 1.6\n"
-    "🔥 3 clips automáticos\n"
-    "⏱️ Videos de hasta 60 minutos\n"
-    "📱 Formato vertical 9:16\n"
-    "🎞️ Clips de 30 a 60 segundos"
-)
-
-==================================================
-
-OBTENER DURACIÓN
-
-==================================================
-
-def obtener_duracion(video):
-
-resultado = ejecutar([
-    "ffprobe",
-    "-v", "error",
-    "-show_entries", "format=duration",
-    "-of",
-    "default=noprint_wrappers=1:nokey=1",
-    video
-])
-if resultado.returncode != 0:
-    raise RuntimeError(
-        "No se pudo obtener la duración del video."
-    )
-return float(resultado.stdout.strip())
-
-==================================================
-
-DESCARGAR VIDEO CON BGUTIL PO TOKEN
-
-==================================================
-
-async def descargar_video(url, folder):
-
-patron = os.path.join(
-    folder,
-    "video.%(ext)s"
-)
-print(
-    "Iniciando descarga de YouTube...",
-    flush=True
-)
-print(
-    f"Proveedor PO Token: {BGUTIL_POT_URL}",
-    flush=True
-)
-comando = [
-    "yt-dlp",
-    "--no-playlist",
-    "--max-filesize", "2G",
-    "--extractor-args",
-    f"youtubepot-bgutilhttp:base_url={BGUTIL_POT_URL}",
-    "-f",
-    "best[height<=720][ext=mp4]/best[height<=720]/best",
-    "--merge-output-format",
-    "mp4",
-    "-o",
-    patron,
-    url
-]
-resultado = await asyncio.to_thread(
-    ejecutar,
-    comando,
-    1800
-)
-archivos = glob.glob(
-    os.path.join(folder, "video.*")
-)
-archivos = [
-    archivo
-    for archivo in archivos
-    if not archivo.endswith(
-        (".part", ".ytdl")
-    )
-]
-if resultado.returncode != 0 or not archivos:
-    print(
-        "ERROR DE DESCARGA:",
-        resultado.stderr[-4000:],
-        flush=True
-    )
-    raise RuntimeError(
-        "No se pudo descargar el video:\n"
-        + resultado.stderr[-1500:]
-    )
-video = archivos[0]
-tamano = os.path.getsize(video)
-if tamano > MAX_VIDEO_BYTES:
-    raise RuntimeError(
-        "El video supera el límite temporal "
-        "de 2 GB configurado para Railway."
-    )
-duracion = await asyncio.to_thread(
-    obtener_duracion,
-    video
-)
-if duracion > DURACION_MAXIMA_VIDEO:
-    raise RuntimeError(
-        "El video supera el límite de 60 minutos."
-    )
-print(
-    f"Descarga terminada. Duración: {duracion:.2f} segundos",
-    flush=True
-)
-return video
-
-==================================================
-
-SUBIR VIDEO A TWELVELABS
-
-==================================================
-
-def subir_video_twelvelabs(video):
-
-client = crear_cliente()
-print(
-    "Iniciando carga multipart a TwelveLabs...",
-    flush=True
-)
-resultado = client.multipart_upload.upload_file(
-    file_path=video,
-    filename=os.path.basename(video),
-    file_type="video",
-    batch_size=5,
-    max_workers=2,
-    max_retries=3,
-    retry_delay=2.0
-)
-asset_id = resultado.asset_id
-if not asset_id:
-    raise RuntimeError(
-        "TwelveLabs no devolvió el identificador del video."
-    )
-print(
-    f"Video subido. Asset ID: {asset_id}",
-    flush=True
-)
-inicio = time.time()
-while True:
-    asset = client.assets.retrieve(asset_id)
-    estado = str(asset.status).lower()
-    print(
-        f"Estado del archivo: {estado}",
-        flush=True
-    )
-    if estado == "ready":
-        return asset_id
-    if estado == "failed":
-        raise RuntimeError(
-            "TwelveLabs no pudo procesar el archivo."
-        )
-    if time.time() - inicio > 1800:
-        raise TimeoutError(
-            "La preparación del video tardó demasiado."
-        )
-    time.sleep(5)
-
-==================================================
-
-ANALIZAR CON PEGASUS 1.6
-
-==================================================
-
-def analizar_video_twelvelabs(asset_id):
-
-client = crear_cliente()
-instrucciones = """
-
-Analiza el video completo y encuentra los TRES mejores
-momentos para crear clips virales de TikTok,
-Instagram Reels y Facebook Reels.
-
-Busca:
-
-* Momentos sorprendentes.
-* Escenas emocionantes.
-* Conversaciones interesantes.
-* Frases impactantes.
-* Historias que despierten curiosidad.
-* Momentos con potencial para captar la atención.
-
-REGLAS:
-
-1. Selecciona momentos de diferentes partes del video.
-2. Evita seleccionar momentos repetidos.
-3. Cada momento debe durar entre 30 y 60 segundos.
-4. Devuelve los tiempos en segundos.
-5. No inventes marcas de tiempo.
-6. Los tiempos deben corresponder al video real.
-7. Prioriza los momentos que puedan captar la atención
-    durante los primeros segundos.
-
-Devuelve exclusivamente JSON válido con esta estructura:
-
-{
-“clips”: [
-{
-“inicio”: 120,
-“fin”: 165,
-“titulo”: “Título atractivo”,
-“motivo”: “Explicación del momento”
-},
-{
-“inicio”: 350,
-“fin”: 395,
-“titulo”: “Segundo momento”,
-“motivo”: “Explicación del momento”
-},
-{
-“inicio”: 700,
-“fin”: 745,
-“titulo”: “Tercer momento”,
-“motivo”: “Explicación del momento”
-}
-]
-}
-“””
-
-print(
-    "Enviando video a Pegasus 1.6...",
-    flush=True
-)
-tarea = client.analyze_async.tasks.create(
-    model_name=MODELO,
-    video=VideoContext_AssetId(
-        asset_id=asset_id
-    ),
-    prompt=instrucciones,
-    max_tokens=4096
-)
-task_id = tarea.task_id
-print(
-    f"Análisis iniciado. Task ID: {task_id}",
-    flush=True
-)
-inicio_espera = time.time()
-while True:
-    resultado = client.analyze_async.tasks.retrieve(
-        task_id
-    )
-    estado = str(resultado.status).lower()
-    print(
-        f"Estado del análisis Pegasus: {estado}",
-        flush=True
-    )
-    if estado == "ready":
-        if not resultado.result or not resultado.result.data:
-            raise RuntimeError(
-                "Pegasus terminó sin devolver resultados."
-            )
-        return resultado.result.data
-    if estado in ("failed", "canceled"):
-        error = getattr(
-            resultado,
-            "error",
-            None
-        )
-        raise RuntimeError(
-            f"Análisis fallido: {error}"
-        )
-    if time.time() - inicio_espera > TIEMPO_MAXIMO_ANALISIS:
-        raise TimeoutError(
-            "Pegasus superó el tiempo máximo de análisis."
-        )
-    time.sleep(10)
-
-==================================================
-
-VALIDAR RESULTADOS
-
-==================================================
-
-def validar_resultados(texto):
-
-texto = texto.strip()
-texto = re.sub(
-    r"^```(?:json)?\s*",
-    "",
-    texto
-)
-texto = re.sub(
-    r"\s*```$",
-    "",
-    texto
-)
-datos = json.loads(texto)
-clips = datos.get("clips", [])
-if not isinstance(clips, list):
-    raise RuntimeError(
-        "Pegasus devolvió una lista inválida."
-    )
-clips_validos = []
-for clip in clips:
-    if not isinstance(clip, dict):
-        continue
+    if not isinstance(url, str):
+        return False
+    url = url.strip()
     try:
-        inicio = float(clip["inicio"])
-        fin = float(clip["fin"])
-        duracion = fin - inicio
-        if inicio < 0:
-            continue
-        if DURACION_MINIMA <= duracion <= DURACION_MAXIMA:
-            clips_validos.append({
+        datos = urlparse(url)
+        host = (datos.netloc or "").lower().split(":")[0]
+        hosts_validos = {
+            "youtube.com",
+            "www.youtube.com",
+            "m.youtube.com",
+            "youtu.be",
+            "www.youtu.be",
+            "youtube-nocookie.com",
+            "www.youtube-nocookie.com",
+        }
+        return datos.scheme in ("http", "https") and host in hosts_validos
+    except Exception:
+        return False
+
+
+def obtener_duracion(ruta):
+    salida = ejecutar_comando(
+        [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            ruta,
+        ],
+        60,
+    )
+    return float(salida.strip())
+
+
+def localizar_video(carpeta):
+    candidatos = []
+    for archivo in glob.glob(os.path.join(carpeta, "video.*")):
+        if os.path.isfile(archivo) and not archivo.endswith((".part", ".ytdl")):
+            candidatos.append(archivo)
+    if not candidatos:
+        raise RuntimeError("YouTube no entregó un archivo de video descargado.")
+    return max(candidatos, key=os.path.getsize)
+
+
+def descargar_video(url, carpeta):
+    patron = os.path.join(carpeta, "video.%(ext)s")
+    comando = [
+        "yt-dlp",
+        "--no-playlist",
+        "--no-warnings",
+        "--retries", "5",
+        "--fragment-retries", "5",
+        "--socket-timeout", "30",
+        "--max-filesize", str(MAX_VIDEO_BYTES),
+        "--extractor-args",
+        "youtubepot-bgutilhttp:base_url=" + BGUTIL_POT_URL,
+        "-f",
+        "best[height<=720][ext=mp4]/best[height<=720]/best",
+        "--merge-output-format", "mp4",
+        "-o", patron,
+        url,
+    ]
+    ejecutar_comando(comando, TIEMPO_MAXIMO_DESCARGA)
+    ruta = localizar_video(carpeta)
+    tamano = os.path.getsize(ruta)
+    if tamano > MAX_VIDEO_BYTES:
+        raise RuntimeError("El video supera el límite de 2 GB.")
+    duracion = obtener_duracion(ruta)
+    if duracion <= 0:
+        raise RuntimeError("No pude determinar la duración del video.")
+    if duracion > DURACION_MAXIMA_VIDEO:
+        raise RuntimeError("El video supera el límite de 60 minutos.")
+    return ruta, duracion
+
+
+def esperar_asset(cliente, asset_id):
+    inicio = time.time()
+    while time.time() - inicio < TIEMPO_MAXIMO_ANALISIS:
+        asset = cliente.assets.retrieve(asset_id)
+        estado = str(getattr(asset, "status", "")).lower()
+        if estado == "ready":
+            return
+        if estado in ("failed", "error"):
+            raise RuntimeError("TwelveLabs no pudo procesar el video.")
+        time.sleep(8)
+    raise TimeoutError("TwelveLabs tardó demasiado procesando el video.")
+
+
+def subir_a_twelvelabs(ruta):
+    cliente = obtener_cliente()
+    resultado = cliente.multipart_upload.upload_file(
+        ruta,
+        file_type="video",
+        max_workers=3,
+        max_retries=3,
+    )
+    asset_id = getattr(resultado, "asset_id", None)
+    if not asset_id:
+        raise RuntimeError("TwelveLabs no devolvió el ID del video.")
+    esperar_asset(cliente, asset_id)
+    return asset_id
+
+
+def analizar_video(asset_id, duracion):
+    cliente = obtener_cliente()
+    prompt = f"""
+Analiza el video completo y encuentra exactamente {CANTIDAD_CLIPS} momentos
+que tengan alto potencial para convertirse en clips cortos virales.
+Prioriza momentos impactantes, sorprendentes, emocionantes, graciosos,
+útiles o con una frase que atrape al público desde el primer segundo.
+Cada clip debe durar entre {DURACION_MINIMA} y {DURACION_MAXIMA} segundos.
+El video dura aproximadamente {duracion:.1f} segundos.
+
+Devuelve SOLAMENTE un JSON válido, sin introducción ni Markdown, con este formato:
+{{
+  "clips": [
+    {{
+      "inicio": 12.5,
+      "fin": 55.0,
+      "titulo": "Título breve en español",
+      "motivo": "Por qué este momento puede funcionar"
+    }}
+  ]
+}}
+Los tiempos inicio y fin deben estar expresados en segundos desde el inicio
+del video. No inventes escenas ni uses tiempos fuera de la duración.
+Devuelve exactamente {CANTIDAD_CLIPS} clips distintos y evita solapamientos.
+"""
+    tarea = cliente.analyze_async.tasks.create(
+        model_name=MODELO,
+        video=VideoContext_AssetId(asset_id=asset_id),
+        prompt=prompt,
+        max_tokens=4096,
+    )
+
+    inicio = time.time()
+    while time.time() - inicio < TIEMPO_MAXIMO_ANALISIS:
+        tarea = cliente.analyze_async.tasks.retrieve(tarea.id)
+        estado = str(getattr(tarea, "status", "")).lower()
+
+        if estado in ("ready", "completed", "succeeded"):
+            resultado = getattr(tarea, "result", None)
+            if resultado is None:
+                raise RuntimeError("El análisis terminó sin devolver resultados.")
+            datos = getattr(resultado, "data", None)
+            if datos is None:
+                datos = str(resultado)
+            return datos
+
+        if estado in ("failed", "error"):
+            raise RuntimeError("TwelveLabs informó un error durante el análisis.")
+        time.sleep(8)
+
+    raise TimeoutError("El análisis superó el tiempo máximo de espera.")
+
+
+def extraer_json(texto):
+    if isinstance(texto, dict):
+        return texto
+    texto = str(texto).strip()
+    texto = re.sub(r"^```(?:json)?\s*", "", texto, flags=re.IGNORECASE)
+    texto = re.sub(r"\s*```$", "", texto)
+    try:
+        return json.loads(texto)
+    except json.JSONDecodeError:
+        inicio = texto.find("{")
+        fin = texto.rfind("}")
+        if inicio >= 0 and fin > inicio:
+            return json.loads(texto[inicio:fin + 1])
+        raise RuntimeError("La IA no devolvió un JSON válido de clips.")
+
+
+def validar_clips(texto, duracion_video):
+    datos = extraer_json(texto)
+    clips = datos.get("clips", []) if isinstance(datos, dict) else []
+    validos = []
+
+    for clip in clips:
+        try:
+            inicio = float(clip.get("inicio"))
+            fin = float(clip.get("fin"))
+            titulo = str(clip.get("titulo", "Clip de video"))[:90]
+            motivo = str(clip.get("motivo", ""))[:250]
+
+            if inicio < 0 or fin > duracion_video or fin <= inicio:
+                continue
+            duracion = fin - inicio
+            if duracion < DURACION_MINIMA or duracion > DURACION_MAXIMA:
+                continue
+
+            validos.append({
                 "inicio": inicio,
                 "fin": fin,
-                "titulo": str(
-                    clip.get(
-                        "titulo",
-                        "Mejor momento"
-                    )
-                ),
-                "motivo": str(
-                    clip.get("motivo", "")
-                )
+                "titulo": titulo,
+                "motivo": motivo,
             })
-    except (KeyError, TypeError, ValueError):
-        continue
-if not clips_validos:
-    raise RuntimeError(
-        "Pegasus no encontró momentos válidos."
-    )
-return clips_validos[:CANTIDAD_CLIPS]
+        except (TypeError, ValueError):
+            continue
 
-==================================================
+    validos.sort(key=lambda x: x["inicio"])
+    seleccionados = []
+    for clip in validos:
+        if all(
+            clip["fin"] <= otro["inicio"] or clip["inicio"] >= otro["fin"]
+            for otro in seleccionados
+        ):
+            seleccionados.append(clip)
+        if len(seleccionados) == CANTIDAD_CLIPS:
+            break
 
-CREAR CLIPS VERTICALES
+    if not seleccionados:
+        raise RuntimeError(
+            "No encontré momentos válidos de 30 a 60 segundos. "
+            "Prueba con otro video."
+        )
+    return seleccionados
 
-==================================================
 
-async def crear_clips(
-update,
-video,
-momentos,
-folder
-):
+def crear_clip_vertical(video, clip, carpeta, numero):
+    salida = os.path.join(carpeta, f"clip_{numero}.mp4")
+    duracion = clip["fin"] - clip["inicio"]
 
-duracion_video = await asyncio.to_thread(
-    obtener_duracion,
-    video
-)
-enviados = 0
-for numero, momento in enumerate(
-    momentos,
-    start=1
-):
-    inicio = momento["inicio"]
-    fin = momento["fin"]
-    duracion = fin - inicio
-    if inicio < 0 or fin > duracion_video:
-        continue
-    if not DURACION_MINIMA <= duracion <= DURACION_MAXIMA:
-        continue
-    clip = os.path.join(
-        folder,
-        f"clip_{numero}.mp4"
-    )
-    await update.message.reply_text(
-        f"🎬 Creando clip {numero} de {len(momentos)}..."
-    )
     comando = [
         "ffmpeg",
         "-y",
-        "-ss", str(inicio),
+        "-ss", f"{clip['inicio']:.3f}",
         "-i", video,
-        "-t", str(duracion),
-        "-map", "0:v:0",
-        "-map", "0:a?",
+        "-t", f"{duracion:.3f}",
         "-vf",
-        "scale=720:1280:force_original_aspect_ratio=increase,"
-        "crop=720:1280",
+        "scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920",
+        "-r", "30",
         "-c:v", "libx264",
         "-preset", "veryfast",
-        "-crf", "27",
+        "-crf", "28",
         "-c:a", "aac",
-        "-b:a", "96k",
-        "-threads", "2",
+        "-b:a", "128k",
         "-movflags", "+faststart",
-        clip
+        "-maxrate", "2500k",
+        "-bufsize", "5000k",
+        salida,
     ]
-    resultado = await asyncio.to_thread(
-        ejecutar,
-        comando,
-        600
+    ejecutar_comando(comando, 900)
+
+    if not os.path.exists(salida):
+        raise RuntimeError("FFmpeg no generó el clip.")
+    if os.path.getsize(salida) > TAMANO_MAXIMO_CLIP:
+        # Segunda compresión para cumplir el límite de envío de Telegram.
+        comando[comando.index("-crf") + 1] = "32"
+        comando[comando.index("-maxrate") + 1] = "1500k"
+        ejecutar_comando(comando, 900)
+
+    if os.path.getsize(salida) > TAMANO_MAXIMO_CLIP:
+        raise RuntimeError("El clip sigue superando el límite de 45 MB.")
+    return salida
+
+
+async def enviar_estado(update, texto):
+    await update.message.reply_text(texto)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mensaje = (
+        "🎬 ¡Bienvenido a CLIPMASTER AI!\n\n"
+        "Envíame un enlace público de YouTube y prepararé hasta 3 clips "
+        "verticales 9:16 de entre 30 y 60 segundos.\n\n"
+        "Límite: videos de hasta 60 minutos."
     )
-    if resultado.returncode != 0:
-        print(
-            resultado.stderr[-2000:],
-            flush=True
+    await update.message.reply_text(mensaje)
+
+
+async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Envía un enlace de YouTube (youtube.com o youtu.be). "
+        "El bot analizará el video y te enviará los mejores clips."
+    )
+
+
+async def procesar_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mensaje = (update.message.text or "").strip()
+    coincidencia = re.search(r"https?://\S+", mensaje)
+    url = coincidencia.group(0).rstrip(").,]}>") if coincidencia else ""
+
+    if not validar_youtube(url):
+        await update.message.reply_text(
+            "⚠️ Envíame un enlace válido de YouTube."
+        )
+        return
+
+    carpeta = tempfile.mkdtemp(prefix="clipmaster_")
+    try:
+        await update.message.reply_text(
+            "📥 Recibí el enlace. Estoy descargando el video..."
+        )
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id,
+            action=ChatAction.TYPING,
+        )
+
+        video, duracion = await asyncio.to_thread(
+            descargar_video, url, carpeta
         )
         await update.message.reply_text(
-            f"⚠️ Error creando el clip {numero}."
+            f"✅ Video descargado ({int(duracion // 60)} min "
+            f"{int(duracion % 60)} s).\n"
+            "🧠 Ahora la IA está analizando los mejores momentos..."
         )
-        continue
-    if not os.path.exists(clip):
-        continue
-    if os.path.getsize(clip) > TAMANO_MAXIMO_CLIP:
+
+        asset_id = await asyncio.to_thread(subir_a_twelvelabs, video)
+        resultado = await asyncio.to_thread(
+            analizar_video, asset_id, duracion
+        )
+        clips = validar_clips(resultado, duracion)
+
         await update.message.reply_text(
-            f"⚠️ El clip {numero} supera el tamaño permitido."
+            f"✂️ Encontré {len(clips)} momentos. Creando clips verticales..."
         )
-        continue
-    titulo = momento["titulo"]
-    motivo = momento["motivo"]
-    with open(clip, "rb") as archivo:
-        await update.message.reply_video(
-            video=archivo,
-            caption=(
-                "🔥 CLIPMASTER AI\n\n"
-                f"🎬 {titulo}\n"
-                f"💡 {motivo}\n\n"
-                "📱 Formato vertical 9:16"
+
+        enviados = 0
+        for numero, clip in enumerate(clips, start=1):
+            ruta_clip = await asyncio.to_thread(
+                crear_clip_vertical, video, clip, carpeta, numero
             )
-        )
-    enviados += 1
-await update.message.reply_text(
-    "✅ PROCESAMIENTO TERMINADO\n\n"
-    f"Clips enviados: {enviados}/{CANTIDAD_CLIPS}"
-)
+            caption = (
+                f"🎬 CLIP {numero}\n"
+                f"{clip['titulo']}\n"
+                f"⏱ {int(clip['inicio'])}s - {int(clip['fin'])}s"
+            )
+            with open(ruta_clip, "rb") as archivo:
+                await update.message.reply_video(
+                    video=archivo,
+                    caption=caption[:1024],
+                    supports_streaming=True,
+                    read_timeout=180,
+                    write_timeout=180,
+                    connect_timeout=60,
+                )
+            enviados += 1
 
-==================================================
+        await update.message.reply_text(
+            f"✅ ¡Proceso terminado! Te envié {enviados} clip(s) en formato 9:16."
+        )
 
-PROCESAR VIDEO
+    except subprocess.TimeoutExpired:
+        logger.exception("Tiempo agotado en un proceso externo")
+        await update.message.reply_text(
+            "⏳ Una operación tardó demasiado. Inténtalo otra vez con otro video."
+        )
+    except Exception as error:
+        logger.exception("Error procesando video")
+        detalle = str(error).strip()
+        if len(detalle) > 900:
+            detalle = detalle[-900:]
+        await update.message.reply_text(
+            "❌ No pude completar el procesamiento.\n\n"
+            f"Detalle: {detalle or 'Error desconocido'}"
+        )
+    finally:
+        shutil.rmtree(carpeta, ignore_errors=True)
 
-==================================================
 
-async def process_video(
-update: Update,
-context: ContextTypes.DEFAULT_TYPE
-):
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Error no controlado del bot", exc_info=context.error)
 
-url = update.message.text.strip()
-if not validar_youtube(url):
-    await update.message.reply_text(
-        "❌ Envíame un enlace válido de YouTube."
-    )
-    return
-mensaje = await update.message.reply_text(
-    "📥 RECIBÍ TU VIDEO.\n\n"
-    "Preparando descarga..."
-)
-try:
-    with tempfile.TemporaryDirectory() as folder:
-        # DESCARGAR VIDEO
-        await mensaje.edit_text(
-            "📥 DESCARGANDO VIDEO DE YOUTUBE..."
-        )
-        video = await descargar_video(
-            url,
-            folder
-        )
-        # SUBIR A TWELVELABS
-        await mensaje.edit_text(
-            "☁️ SUBIENDO VIDEO A TWELVELABS...\n\n"
-            "Esto puede tardar dependiendo del tamaño."
-        )
-        asset_id = await asyncio.to_thread(
-            subir_video_twelvelabs,
-            video
-        )
-        # ANALIZAR VIDEO
-        await mensaje.edit_text(
-            "🧠 PEGASUS 1.6 ESTÁ ANALIZANDO EL VIDEO...\n\n"
-            "Buscando los tres mejores momentos."
-        )
-        texto = await asyncio.to_thread(
-            analizar_video_twelvelabs,
-            asset_id
-        )
-        momentos = validar_resultados(
-            texto
-        )
-        # CREAR CLIPS
-        await mensaje.edit_text(
-            "🔥 PEGASUS ENCONTRÓ LOS MOMENTOS.\n\n"
-            "Preparando tus clips verticales..."
-        )
-        await crear_clips(
-            update,
-            video,
-            momentos,
-            folder
-        )
-        await mensaje.edit_text(
-            "✅ CLIPMASTER AI TERMINÓ EL TRABAJO."
-        )
-except TimeoutError as error:
-    await update.message.reply_text(
-        "⏱️ EL PROCESAMIENTO TARDÓ DEMASIADO.\n\n"
-        f"{str(error)}"
-    )
-except Exception as error:
-    print(
-        "ERROR COMPLETO:",
-        flush=True
-    )
-    traceback.print_exc()
-    await update.message.reply_text(
-        "⚠️ ERROR DE PROCESAMIENTO:\n\n"
-        f"{type(error).__name__}: "
-        f"{str(error)[:1500]}"
-    )
-
-==================================================
-
-INICIAR BOT
-
-==================================================
 
 def main():
+    if not TOKEN:
+        raise RuntimeError("Falta configurar BOT_TOKEN en Railway.")
+    if not TWELVELABS_API_KEY:
+        raise RuntimeError("Falta configurar TWELVELABS_API_KEY en Railway.")
 
-if not TOKEN:
-    raise RuntimeError(
-        "Falta configurar BOT_TOKEN en Railway."
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ayuda", ayuda))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_video))
+    app.add_error_handler(error_handler)
+
+    logger.info("CLIPMASTER AI iniciado correctamente.")
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
     )
-if not TWELVELABS_API_KEY:
-    raise RuntimeError(
-        "Falta configurar TWELVELABS_API_KEY en Railway."
-    )
-app = Application.builder().token(TOKEN).build()
-app.add_handler(
-    CommandHandler("start", start)
-)
-app.add_handler(
-    MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        process_video
-    )
-)
-print(
-    "CLIPMASTER AI CON TWELVELABS PEGASUS 1.6 INICIADO",
-    flush=True
-)
-print(
-    f"Proveedor BgUtils configurado: {BGUTIL_POT_URL}",
-    flush=True
-)
-app.run_polling()
 
-==================================================
 
-EJECUCIÓN
-
-==================================================
-
-if name == “main”:
-main()
+if __name__ == "__main__":
+    main()
