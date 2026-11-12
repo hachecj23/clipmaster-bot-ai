@@ -207,16 +207,24 @@ Los tiempos inicio y fin deben estar expresados en segundos desde el inicio
 del video. No inventes escenas ni uses tiempos fuera de la duración.
 Devuelve exactamente {CANTIDAD_CLIPS} clips distintos y evita solapamientos.
 """
-    tarea = cliente.analyze_async.tasks.create(
+    tarea_creada = cliente.analyze_async.tasks.create(
         model_name=MODELO,
         video=VideoContext_AssetId(asset_id=asset_id),
         prompt=prompt,
         max_tokens=4096,
     )
 
+    # TwelveLabs devuelve task_id (no id) al crear una tarea.
+    task_id = getattr(tarea_creada, "task_id", None)
+    if not task_id:
+        raise RuntimeError(
+            "TwelveLabs no devolvió task_id al crear el análisis. "
+            f"Respuesta recibida: {tarea_creada!r}"
+        )
+
     inicio = time.time()
     while time.time() - inicio < TIEMPO_MAXIMO_ANALISIS:
-        tarea = cliente.analyze_async.tasks.retrieve(tarea.id)
+        tarea = cliente.analyze_async.tasks.retrieve(task_id)
         estado = str(getattr(tarea, "status", "")).lower()
 
         if estado in ("ready", "completed", "succeeded"):
@@ -228,8 +236,10 @@ Devuelve exactamente {CANTIDAD_CLIPS} clips distintos y evita solapamientos.
                 datos = str(resultado)
             return datos
 
-        if estado in ("failed", "error"):
-            raise RuntimeError("TwelveLabs informó un error durante el análisis.")
+        if estado in ("failed", "canceled", "error"):
+            error_info = getattr(tarea, "error", None)
+            detalle = getattr(error_info, "message", None) or str(error_info or estado)
+            raise RuntimeError(f"TwelveLabs no pudo completar el análisis: {detalle}")
         time.sleep(8)
 
     raise TimeoutError("El análisis superó el tiempo máximo de espera.")
