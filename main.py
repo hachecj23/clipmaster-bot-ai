@@ -371,9 +371,9 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 folder
             )
 
-    except Exception as traceback.print_exc(
-        await update.message.reply_text()
+    except Exception as error:
         
+        await update.message.reply_text()
             "⚠️ ERROR DE PROCESAMIENTO:\n\n"
             + traceback.format_exc()[-3000:]
         )
