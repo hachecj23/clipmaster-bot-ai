@@ -456,4 +456,4 @@ async def process_video(
             "Inténtalo nuevamente más tarde."
         )
 
-    except Exception as error
+    except Exception as error:
