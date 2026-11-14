@@ -6,7 +6,7 @@ ENV DENO_INSTALL=/usr/local
 
 RUN curl -fsSL https://deno.land/install.sh | sh
 
-ENV PATH=”/usr/local/bin:$PATH”
+ENV PATH="/usr/local/bin:$PATH"
 
 WORKDIR /app
 
@@ -16,4 +16,4 @@ RUN pip install --no-cache-dir -r requirements.txt && pip install --no-cache-dir
 
 COPY . .
 
-CMD [“python”, “main.py”]
+CMD ["python", "main.py"]
