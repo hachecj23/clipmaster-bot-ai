@@ -16,6 +16,7 @@ from urllib.parse import urlparse, urlencode
 
 from telegram import Update
 from telegram.constants import ChatAction
+from telegram.error import TimedOut, NetworkError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -1058,6 +1059,46 @@ async def ayuda(update, context):
 
 
 # ==========================================
+# ENVIAR VIDEO CON REINTENTOS
+# ==========================================
+
+async def enviar_video(update, ruta, caption):
+
+    maximo = 3
+
+    for intento in range(1, maximo + 1):
+
+        try:
+
+            with open(ruta, "rb") as archivo:
+
+                await update.message.reply_video(
+                    video=archivo,
+                    caption=caption[:1024],
+                    supports_streaming=True,
+                    read_timeout=300,
+                    write_timeout=300,
+                    connect_timeout=60,
+                    pool_timeout=60
+                )
+
+            return
+
+        except (TimedOut, NetworkError):
+
+            logger.warning(
+                "Envio a Telegram fallo (intento %s/%s).",
+                intento,
+                maximo
+            )
+
+            if intento == maximo:
+                raise
+
+            await asyncio.sleep(5)
+
+
+# ==========================================
 # PROCESAR VIDEO
 # ==========================================
 
@@ -1155,16 +1196,7 @@ async def procesar_video(update, context):
                 f"{int(clip['fin'])}s"
             )
 
-            with open(ruta, "rb") as archivo:
-
-                await update.message.reply_video(
-                    video=archivo,
-                    caption=caption[:1024],
-                    supports_streaming=True,
-                    read_timeout=180,
-                    write_timeout=180,
-                    connect_timeout=60
-                )
+            await enviar_video(update, ruta, caption)
 
             enviados += 1
 
@@ -1248,6 +1280,10 @@ def main():
     app = (
         Application.builder()
         .token(TOKEN)
+        .read_timeout(60)
+        .write_timeout(60)
+        .connect_timeout(30)
+        .pool_timeout(30)
         .build()
     )
 
