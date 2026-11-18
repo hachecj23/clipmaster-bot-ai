@@ -8,9 +8,11 @@ import asyncio
 import tempfile
 import subprocess
 import logging
+import urllib.request
+import urllib.error
 
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 
 from telegram import Update
 from telegram.constants import ChatAction
@@ -32,6 +34,13 @@ from twelvelabs.types import VideoContext_AssetId
 
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_KEY = os.getenv("TWELVELABS_API_KEY", "").strip()
+
+# Tunelio: servicio externo para obtener el video de YouTube.
+# Si TUNELIO_API_KEY no existe, el bot usa yt-dlp como antes.
+TUNELIO_API_KEY = os.getenv("TUNELIO_API_KEY", "").strip()
+TUNELIO_BASE_URL = "https://tunelio.dev"
+# Plan Trial: hasta 720p. Plan Pro: hasta 1080p.
+TUNELIO_QUALITY = os.getenv("TUNELIO_QUALITY", "720p").strip()
 
 BGUTIL_POT_URL = os.getenv(
     "BGUTIL_POT_URL",
@@ -164,10 +173,350 @@ def validar_youtube(url):
 
 
 # ==========================================
-# DESCARGA DE YOUTUBE
+# VERIFICAR VIDEO DESCARGADO
 # ==========================================
 
-def descargar_video(url, carpeta):
+def leer_duracion(video):
+
+    salida = ejecutar_comando([
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        video
+    ], 60)
+
+    return float(salida.strip())
+
+
+def verificar_video(video):
+
+    try:
+
+        duracion = leer_duracion(video)
+
+    except (ValueError, RuntimeError):
+
+        # Algunos MP4 en streaming no traen la duración.
+        # Se reempaqueta sin recodificar y se vuelve a leer.
+        logger.info("Reempaquetando video para leer la duración.")
+
+        arreglado = video + ".fix.mp4"
+
+        ejecutar_comando([
+            "ffmpeg",
+            "-y",
+            "-i", video,
+            "-c", "copy",
+            "-movflags", "+faststart",
+            arreglado
+        ], 1800)
+
+        os.replace(arreglado, video)
+
+        duracion = leer_duracion(video)
+
+    if duracion <= 0:
+
+        raise RuntimeError(
+            "No se pudo determinar la duración."
+        )
+
+    if duracion > DURACION_MAXIMA_VIDEO:
+
+        raise RuntimeError(
+            "El video supera el límite de 60 minutos."
+        )
+
+    return video, duracion
+
+
+# ==========================================
+# DESCARGA CON TUNELIO
+# ==========================================
+
+class ErrorDescargaHttp(RuntimeError):
+
+    def __init__(self, codigo):
+
+        super().__init__(
+            f"Falló la descarga del archivo (HTTP {codigo})."
+        )
+
+        self.codigo = codigo
+
+
+def tunelio_pedir(ruta, parametros, reintentos=3):
+
+    direccion = (
+        TUNELIO_BASE_URL
+        + ruta
+        + "?"
+        + urlencode(parametros)
+    )
+
+    cabeceras = {
+        "Authorization": "Bearer " + TUNELIO_API_KEY,
+        "Accept": "application/json",
+        "User-Agent": "ClipmasterBot/1.0"
+    }
+
+    ultimo_error = "Error desconocido"
+
+    for intento in range(1, reintentos + 1):
+
+        espera = 5 * intento
+
+        peticion = urllib.request.Request(
+            direccion,
+            headers=cabeceras
+        )
+
+        try:
+
+            with urllib.request.urlopen(
+                peticion,
+                timeout=60
+            ) as respuesta:
+
+                cuerpo = respuesta.read().decode(
+                    "utf-8",
+                    errors="replace"
+                )
+
+            return json.loads(cuerpo)
+
+        except urllib.error.HTTPError as error:
+
+            codigo = error.code
+
+            try:
+
+                texto = error.read().decode(
+                    "utf-8",
+                    errors="replace"
+                )
+
+                info = json.loads(texto)
+
+                detalle = str(
+                    info.get("message")
+                    or info.get("error")
+                    or ""
+                )
+
+            except Exception:
+
+                detalle = ""
+
+            if codigo == 401:
+
+                raise RuntimeError(
+                    "Tunelio rechazó la clave (401). "
+                    "Revisa TUNELIO_API_KEY en Railway."
+                )
+
+            if codigo == 402:
+
+                raise RuntimeError(
+                    "Tunelio se quedó sin créditos (402)."
+                )
+
+            if codigo == 404:
+
+                raise RuntimeError(
+                    "El video no existe, es privado "
+                    "o fue eliminado."
+                )
+
+            if codigo in (429, 500, 503):
+
+                ultimo_error = (
+                    f"Tunelio respondió {codigo}. {detalle}"
+                )
+
+                if codigo == 429:
+
+                    try:
+
+                        espera = min(
+                            int(error.headers.get(
+                                "Retry-After",
+                                "10"
+                            )),
+                            60
+                        )
+
+                    except ValueError:
+
+                        espera = 10
+
+            else:
+
+                raise RuntimeError(
+                    f"Tunelio error {codigo}: {detalle}"
+                )
+
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            ValueError,
+            OSError
+        ) as error:
+
+            ultimo_error = (
+                "No se pudo conectar con Tunelio: "
+                + str(error)
+            )
+
+        logger.info(
+            "Tunelio %s intento %s/%s falló: %s",
+            ruta,
+            intento,
+            reintentos,
+            ultimo_error
+        )
+
+        if intento < reintentos:
+
+            time.sleep(espera)
+
+    raise RuntimeError(ultimo_error)
+
+
+def bajar_archivo(enlace, destino, tamano_esperado=None):
+
+    peticion = urllib.request.Request(
+        enlace,
+        headers={"User-Agent": "ClipmasterBot/1.0"}
+    )
+
+    inicio = time.time()
+    total = 0
+
+    try:
+
+        with urllib.request.urlopen(
+            peticion,
+            timeout=60
+        ) as respuesta, open(destino, "wb") as archivo:
+
+            while True:
+
+                bloque = respuesta.read(1024 * 1024)
+
+                if not bloque:
+                    break
+
+                total += len(bloque)
+
+                if total > MAX_VIDEO_BYTES:
+
+                    raise RuntimeError(
+                        "El video supera los 2 GB."
+                    )
+
+                if time.time() - inicio > TIEMPO_DESCARGA:
+
+                    raise RuntimeError(
+                        "La descarga tardó demasiado."
+                    )
+
+                archivo.write(bloque)
+
+    except urllib.error.HTTPError as error:
+
+        raise ErrorDescargaHttp(error.code) from None
+
+    if total == 0:
+
+        raise RuntimeError(
+            "Tunelio entregó un archivo vacío."
+        )
+
+    if tamano_esperado and total < tamano_esperado * 0.9:
+
+        raise RuntimeError(
+            "La descarga quedó incompleta."
+        )
+
+
+def descargar_video_tunelio(url, carpeta):
+
+    info = tunelio_pedir("/info", {"url": url})
+
+    duracion_info = info.get("duration_seconds")
+
+    if (
+        isinstance(duracion_info, (int, float))
+        and duracion_info > DURACION_MAXIMA_VIDEO
+    ):
+
+        raise RuntimeError(
+            "El video supera el límite de 60 minutos."
+        )
+
+    creado = tunelio_pedir(
+        "/create",
+        {"url": url, "quality": TUNELIO_QUALITY}
+    )
+
+    enlace = creado.get("url")
+
+    if creado.get("status") != "ok" or not enlace:
+
+        raise RuntimeError(
+            "Tunelio no entregó enlace de descarga: "
+            + str(creado.get("status"))
+        )
+
+    tamano = creado.get("file_size")
+
+    if not isinstance(tamano, int):
+        tamano = None
+
+    if tamano and tamano > MAX_VIDEO_BYTES:
+
+        raise RuntimeError(
+            "El video supera los 2 GB."
+        )
+
+    destino = os.path.join(carpeta, "video.mp4")
+
+    separador = "&" if "?" in enlace else "?"
+
+    logger.info(
+        "Descargando desde Tunelio (%s).",
+        TUNELIO_QUALITY
+    )
+
+    try:
+
+        # progressive=1 entrega un MP4 normal, fácil de recortar.
+        bajar_archivo(
+            enlace + separador + "progressive=1",
+            destino,
+            tamano
+        )
+
+    except ErrorDescargaHttp as error:
+
+        if error.codigo != 413:
+            raise
+
+        # Archivo muy grande para ese formato: descarga normal.
+        logger.info("Archivo grande, descarga normal.")
+
+        bajar_archivo(enlace, destino, tamano)
+
+    return verificar_video(destino)
+
+
+# ==========================================
+# DESCARGA DE YOUTUBE CON YT-DLP (RESPALDO)
+# ==========================================
+
+def descargar_video_ytdlp(url, carpeta):
 
     patron = os.path.join(
         carpeta,
@@ -230,7 +579,7 @@ def descargar_video(url, carpeta):
 
     comando.append(url)
 
-    logger.info("Iniciando descarga de YouTube.")
+    logger.info("Iniciando descarga de YouTube con yt-dlp.")
 
     ejecutar_comando(
         comando,
@@ -264,29 +613,24 @@ def descargar_video(url, carpeta):
             "El video supera los 2 GB."
         )
 
-    salida = ejecutar_comando([
-        "ffprobe",
-        "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        video
-    ], 60)
+    return verificar_video(video)
 
-    duracion = float(salida.strip())
 
-    if duracion <= 0:
+# ==========================================
+# DESCARGA (ELIGE TUNELIO O YT-DLP)
+# ==========================================
 
-        raise RuntimeError(
-            "No se pudo determinar la duración."
-        )
+def descargar_video(url, carpeta):
 
-    if duracion > DURACION_MAXIMA_VIDEO:
+    if TUNELIO_API_KEY:
 
-        raise RuntimeError(
-            "El video supera el límite de 60 minutos."
-        )
+        return descargar_video_tunelio(url, carpeta)
 
-    return video, duracion
+    logger.warning(
+        "Falta TUNELIO_API_KEY. Se usa yt-dlp."
+    )
+
+    return descargar_video_ytdlp(url, carpeta)
 
 
 # ==========================================
@@ -882,6 +1226,16 @@ def main():
 
         raise RuntimeError(
             "Falta TWELVELABS_API_KEY en Railway."
+        )
+
+    if TUNELIO_API_KEY:
+
+        logger.info("Descarga mediante Tunelio activada.")
+
+    else:
+
+        logger.warning(
+            "Sin TUNELIO_API_KEY: se usará yt-dlp."
         )
 
     app = (
