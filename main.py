@@ -10,9 +10,12 @@ import subprocess
 import logging
 import urllib.request
 import urllib.error
+import math
 
 from pathlib import Path
 from urllib.parse import urlparse, urlencode
+
+import cv2
 
 from telegram import Update
 from telegram.constants import ChatAction
@@ -28,19 +31,15 @@ from telegram.ext import (
 from twelvelabs import TwelveLabs
 from twelvelabs.types import VideoContext_AssetId
 
-
-# ==========================================
+# =========================================================
 # CONFIGURACIÓN
-# ==========================================
+# =========================================================
 
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_KEY = os.getenv("TWELVELABS_API_KEY", "").strip()
 
-# Tunelio: servicio externo para obtener el video de YouTube.
-# Si TUNELIO_API_KEY no existe, el bot usa yt-dlp como antes.
 TUNELIO_API_KEY = os.getenv("TUNELIO_API_KEY", "").strip()
 TUNELIO_BASE_URL = "https://tunelio.dev"
-# Plan Trial: hasta 720p. Plan Pro: hasta 1080p.
 TUNELIO_QUALITY = os.getenv("TUNELIO_QUALITY", "720p").strip()
 
 BGUTIL_POT_URL = os.getenv(
@@ -48,8 +47,6 @@ BGUTIL_POT_URL = os.getenv(
     "http://bgutil-ytdlp-pot-provider.railway.internal:4416"
 ).strip()
 
-# Cookies opcionales de YouTube.
-# Se guardan como variable secreta en Railway.
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "")
 
 MODELO = "pegasus1.6"
@@ -65,10 +62,9 @@ MAX_CLIP_BYTES = 45 * 1024 * 1024
 TIEMPO_DESCARGA = 1800
 TIEMPO_ANALISIS = 3600
 
-
-# ==========================================
-# LOGS
-# ==========================================
+FACE_SAMPLE_EVERY = 2
+FACE_DETECT_SCALE = 0.5
+FACE_SMOOTHING = 0.72
 
 logging.basicConfig(
     level=logging.INFO,
@@ -76,20 +72,17 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("CLIPMASTER_AI")
-
 cliente = None
 
 
-# ==========================================
+# =========================================================
 # TWELVELABS
-# ==========================================
+# =========================================================
 
 def obtener_cliente():
-
     global cliente
 
     if cliente is None:
-
         if not API_KEY:
             raise RuntimeError(
                 "Falta TWELVELABS_API_KEY en Railway."
@@ -100,9 +93,9 @@ def obtener_cliente():
     return cliente
 
 
-# ==========================================
+# =========================================================
 # EJECUTAR COMANDOS
-# ==========================================
+# =========================================================
 
 def ejecutar_comando(comando, timeout=900):
 
@@ -113,7 +106,11 @@ def ejecutar_comando(comando, timeout=900):
         timeout=timeout
     )
 
-    salida = (proceso.stdout or "") + "\n" + (proceso.stderr or "")
+    salida = (
+        (proceso.stdout or "")
+        + "\n"
+        + (proceso.stderr or "")
+    )
 
     if comando and Path(str(comando[0])).name.lower().startswith("yt-dlp"):
 
@@ -146,16 +143,14 @@ def ejecutar_comando(comando, timeout=900):
     return proceso.stdout
 
 
-# ==========================================
+# =========================================================
 # VALIDAR YOUTUBE
-# ==========================================
+# =========================================================
 
 def validar_youtube(url):
 
     try:
-
         datos = urlparse(url)
-
         host = datos.netloc.lower().split(":")[0]
 
         permitidos = [
@@ -172,13 +167,12 @@ def validar_youtube(url):
         )
 
     except Exception:
-
         return False
 
 
-# ==========================================
-# VERIFICAR VIDEO DESCARGADO
-# ==========================================
+# =========================================================
+# VERIFICAR VIDEO
+# =========================================================
 
 def leer_duracion(video):
 
@@ -196,13 +190,10 @@ def leer_duracion(video):
 def verificar_video(video):
 
     try:
-
         duracion = leer_duracion(video)
 
     except (ValueError, RuntimeError):
 
-        # Algunos MP4 en streaming no traen la duración.
-        # Se reempaqueta sin recodificar y se vuelve a leer.
         logger.info("Reempaquetando video para leer la duración.")
 
         arreglado = video + ".fix.mp4"
@@ -217,36 +208,27 @@ def verificar_video(video):
         ], 1800)
 
         os.replace(arreglado, video)
-
         duracion = leer_duracion(video)
 
     if duracion <= 0:
-
-        raise RuntimeError(
-            "No se pudo determinar la duración."
-        )
+        raise RuntimeError("No se pudo determinar la duración.")
 
     if duracion > DURACION_MAXIMA_VIDEO:
-
-        raise RuntimeError(
-            "El video supera el límite de 60 minutos."
-        )
+        raise RuntimeError("El video supera el límite de 60 minutos.")
 
     return video, duracion
 
 
-# ==========================================
+# =========================================================
 # DESCARGA CON TUNELIO
-# ==========================================
+# =========================================================
 
 class ErrorDescargaHttp(RuntimeError):
 
     def __init__(self, codigo):
-
         super().__init__(
             f"Falló la descarga del archivo (HTTP {codigo})."
         )
-
         self.codigo = codigo
 
 
@@ -295,7 +277,6 @@ def tunelio_pedir(ruta, parametros, reintentos=3):
             codigo = error.code
 
             try:
-
                 texto = error.read().decode(
                     "utf-8",
                     errors="replace"
@@ -310,24 +291,20 @@ def tunelio_pedir(ruta, parametros, reintentos=3):
                 )
 
             except Exception:
-
                 detalle = ""
 
             if codigo == 401:
-
                 raise RuntimeError(
                     "Tunelio rechazó la clave (401). "
                     "Revisa TUNELIO_API_KEY en Railway."
                 )
 
             if codigo == 402:
-
                 raise RuntimeError(
                     "Tunelio se quedó sin créditos (402)."
                 )
 
             if codigo == 404:
-
                 raise RuntimeError(
                     "El video no existe, es privado "
                     "o fue eliminado."
@@ -340,23 +317,15 @@ def tunelio_pedir(ruta, parametros, reintentos=3):
                 )
 
                 if codigo == 429:
-
                     try:
-
                         espera = min(
-                            int(error.headers.get(
-                                "Retry-After",
-                                "10"
-                            )),
+                            int(error.headers.get("Retry-After", "10")),
                             60
                         )
-
                     except ValueError:
-
                         espera = 10
 
             else:
-
                 raise RuntimeError(
                     f"Tunelio error {codigo}: {detalle}"
                 )
@@ -382,7 +351,6 @@ def tunelio_pedir(ruta, parametros, reintentos=3):
         )
 
         if intento < reintentos:
-
             time.sleep(espera)
 
     raise RuntimeError(ultimo_error)
@@ -415,34 +383,21 @@ def bajar_archivo(enlace, destino, tamano_esperado=None):
                 total += len(bloque)
 
                 if total > MAX_VIDEO_BYTES:
-
-                    raise RuntimeError(
-                        "El video supera los 2 GB."
-                    )
+                    raise RuntimeError("El video supera los 2 GB.")
 
                 if time.time() - inicio > TIEMPO_DESCARGA:
-
-                    raise RuntimeError(
-                        "La descarga tardó demasiado."
-                    )
+                    raise RuntimeError("La descarga tardó demasiado.")
 
                 archivo.write(bloque)
 
     except urllib.error.HTTPError as error:
-
         raise ErrorDescargaHttp(error.code) from None
 
     if total == 0:
-
-        raise RuntimeError(
-            "Tunelio entregó un archivo vacío."
-        )
+        raise RuntimeError("Tunelio entregó un archivo vacío.")
 
     if tamano_esperado and total < tamano_esperado * 0.9:
-
-        raise RuntimeError(
-            "La descarga quedó incompleta."
-        )
+        raise RuntimeError("La descarga quedó incompleta.")
 
 
 def descargar_video_tunelio(url, carpeta):
@@ -455,10 +410,7 @@ def descargar_video_tunelio(url, carpeta):
         isinstance(duracion_info, (int, float))
         and duracion_info > DURACION_MAXIMA_VIDEO
     ):
-
-        raise RuntimeError(
-            "El video supera el límite de 60 minutos."
-        )
+        raise RuntimeError("El video supera el límite de 60 minutos.")
 
     creado = tunelio_pedir(
         "/create",
@@ -468,7 +420,6 @@ def descargar_video_tunelio(url, carpeta):
     enlace = creado.get("url")
 
     if creado.get("status") != "ok" or not enlace:
-
         raise RuntimeError(
             "Tunelio no entregó enlace de descarga: "
             + str(creado.get("status"))
@@ -480,13 +431,9 @@ def descargar_video_tunelio(url, carpeta):
         tamano = None
 
     if tamano and tamano > MAX_VIDEO_BYTES:
-
-        raise RuntimeError(
-            "El video supera los 2 GB."
-        )
+        raise RuntimeError("El video supera los 2 GB.")
 
     destino = os.path.join(carpeta, "video.mp4")
-
     separador = "&" if "?" in enlace else "?"
 
     logger.info(
@@ -496,7 +443,6 @@ def descargar_video_tunelio(url, carpeta):
 
     try:
 
-        # progressive=1 entrega un MP4 normal, fácil de recortar.
         bajar_archivo(
             enlace + separador + "progressive=1",
             destino,
@@ -508,17 +454,15 @@ def descargar_video_tunelio(url, carpeta):
         if error.codigo != 413:
             raise
 
-        # Archivo muy grande para ese formato: descarga normal.
         logger.info("Archivo grande, descarga normal.")
-
         bajar_archivo(enlace, destino, tamano)
 
     return verificar_video(destino)
 
 
-# ==========================================
-# DESCARGA DE YOUTUBE CON YT-DLP (RESPALDO)
-# ==========================================
+# =========================================================
+# DESCARGA YT-DLP DE RESPALDO
+# =========================================================
 
 def descargar_video_ytdlp(url, carpeta):
 
@@ -529,16 +473,13 @@ def descargar_video_ytdlp(url, carpeta):
 
     comando = [
         "yt-dlp",
-
         "--verbose",
         "--force-ipv4",
         "--no-playlist",
         "--no-warnings",
-
         "--retries", "5",
         "--fragment-retries", "5",
         "--socket-timeout", "30",
-
         "--max-filesize", str(MAX_VIDEO_BYTES),
 
         "--extractor-args",
@@ -557,8 +498,6 @@ def descargar_video_ytdlp(url, carpeta):
         patron
     ]
 
-    archivo_cookies = None
-
     if YOUTUBE_COOKIES.strip():
 
         archivo_cookies = os.path.join(
@@ -571,7 +510,6 @@ def descargar_video_ytdlp(url, carpeta):
             "w",
             encoding="utf-8"
         ) as archivo:
-
             archivo.write(YOUTUBE_COOKIES.strip())
 
         comando.extend([
@@ -590,21 +528,14 @@ def descargar_video_ytdlp(url, carpeta):
         TIEMPO_DESCARGA
     )
 
-    candidatos = glob.glob(
-        os.path.join(carpeta, "video.*")
-    )
-
     candidatos = [
-        x for x in candidatos
+        x for x in glob.glob(os.path.join(carpeta, "video.*"))
         if os.path.isfile(x)
-        and not x.endswith((".part", ".ytdl"))
+        and not x.endswith((".part", ".ytdl", ".fix.mp4"))
     ]
 
     if not candidatos:
-
-        raise RuntimeError(
-            "YouTube no entregó ningún archivo."
-        )
+        raise RuntimeError("YouTube no entregó ningún archivo.")
 
     video = max(
         candidatos,
@@ -612,22 +543,14 @@ def descargar_video_ytdlp(url, carpeta):
     )
 
     if os.path.getsize(video) > MAX_VIDEO_BYTES:
-
-        raise RuntimeError(
-            "El video supera los 2 GB."
-        )
+        raise RuntimeError("El video supera los 2 GB.")
 
     return verificar_video(video)
 
 
-# ==========================================
-# DESCARGA (ELIGE TUNELIO O YT-DLP)
-# ==========================================
-
 def descargar_video(url, carpeta):
 
     if TUNELIO_API_KEY:
-
         return descargar_video_tunelio(url, carpeta)
 
     logger.warning(
@@ -637,9 +560,9 @@ def descargar_video(url, carpeta):
     return descargar_video_ytdlp(url, carpeta)
 
 
-# ==========================================
+# =========================================================
 # SUBIR VIDEO A TWELVELABS
-# ==========================================
+# =========================================================
 
 def subir_video(video):
 
@@ -659,10 +582,7 @@ def subir_video(video):
     )
 
     if not asset_id:
-
-        raise RuntimeError(
-            "TwelveLabs no devolvió asset_id."
-        )
+        raise RuntimeError("TwelveLabs no devolvió asset_id.")
 
     inicio = time.time()
 
@@ -674,16 +594,12 @@ def subir_video(video):
             getattr(asset, "status", "")
         ).lower()
 
-        logger.info(
-            "Estado del video: %s",
-            estado
-        )
+        logger.info("Estado del video: %s", estado)
 
         if estado == "ready":
             return asset_id
 
         if estado in ["failed", "error"]:
-
             raise RuntimeError(
                 "TwelveLabs no pudo procesar el video."
             )
@@ -695,21 +611,19 @@ def subir_video(video):
     )
 
 
-# ==========================================
+# =========================================================
 # ANALIZAR VIDEO
-# ==========================================
+# =========================================================
 
 def analizar_video(asset_id, duracion):
 
     api = obtener_cliente()
 
     prompt = f"""
-Analiza el video completo.
+Analiza el video completo, no solo el principio.
 
-Encuentra exactamente 3 momentos interesantes
-que puedan convertirse en clips virales.
-
-Cada clip debe durar entre 30 y 60 segundos.
+Encuentra hasta 8 candidatos para clips virales.
+Cada candidato debe durar entre 30 y 60 segundos.
 
 Busca momentos:
 - Impactantes.
@@ -718,6 +632,8 @@ Busca momentos:
 - Graciosos.
 - Con frases interesantes.
 - Que atrapen la atención.
+
+Evita escenas repetidas y solapamientos.
 
 El video dura {duracion} segundos.
 
@@ -735,10 +651,7 @@ Devuelve solamente JSON válido:
 }}
 
 Los tiempos deben estar expresados en segundos.
-
-No inventes escenas.
-No uses tiempos fuera del video.
-Evita momentos repetidos.
+No inventes escenas ni uses tiempos fuera del video.
 """
 
     tarea_creada = api.analyze_async.tasks.create(
@@ -757,7 +670,6 @@ Evita momentos repetidos.
     )
 
     if not task_id:
-
         raise RuntimeError(
             "TwelveLabs no devolvió task_id: "
             + repr(tarea_creada)
@@ -767,18 +679,13 @@ Evita momentos repetidos.
 
     while time.time() - inicio < TIEMPO_ANALISIS:
 
-        tarea = api.analyze_async.tasks.retrieve(
-            task_id
-        )
+        tarea = api.analyze_async.tasks.retrieve(task_id)
 
         estado = str(
             getattr(tarea, "status", "")
         ).lower()
 
-        logger.info(
-            "Estado del análisis: %s",
-            estado
-        )
+        logger.info("Estado del análisis: %s", estado)
 
         if estado in [
             "ready",
@@ -793,7 +700,6 @@ Evita momentos repetidos.
             )
 
             if resultado is None:
-
                 raise RuntimeError(
                     "El análisis terminó sin resultados."
                 )
@@ -811,7 +717,6 @@ Evita momentos repetidos.
             "canceled",
             "error"
         ]:
-
             raise RuntimeError(
                 "TwelveLabs no pudo completar el análisis."
             )
@@ -823,9 +728,9 @@ Evita momentos repetidos.
     )
 
 
-# ==========================================
-# LEER RESPUESTA JSON
-# ==========================================
+# =========================================================
+# LEER JSON
+# =========================================================
 
 def extraer_json(texto):
 
@@ -848,7 +753,6 @@ def extraer_json(texto):
     )
 
     try:
-
         return json.loads(texto)
 
     except json.JSONDecodeError:
@@ -857,25 +761,26 @@ def extraer_json(texto):
         final = texto.rfind("}")
 
         if inicio >= 0 and final > inicio:
-
-            return json.loads(
-                texto[inicio:final + 1]
-            )
+            return json.loads(texto[inicio:final + 1])
 
         raise RuntimeError(
             "La IA no devolvió JSON válido."
         )
 
 
-# ==========================================
+# =========================================================
 # VALIDAR CLIPS
-# ==========================================
+# =========================================================
 
 def validar_clips(resultado, duracion_video):
 
     datos = extraer_json(resultado)
-
     clips = datos.get("clips", [])
+
+    if not isinstance(clips, list):
+        raise RuntimeError(
+            "La respuesta de la IA no contiene una lista de clips."
+        )
 
     validos = []
 
@@ -886,10 +791,10 @@ def validar_clips(resultado, duracion_video):
             inicio = float(clip["inicio"])
             fin = float(clip["fin"])
 
-            if inicio < 0:
+            if not math.isfinite(inicio) or not math.isfinite(fin):
                 continue
 
-            if fin > duracion_video:
+            if inicio < 0 or fin > duracion_video:
                 continue
 
             if fin <= inicio:
@@ -908,21 +813,23 @@ def validar_clips(resultado, duracion_video):
                 "fin": fin,
                 "titulo": str(
                     clip.get("titulo", "Clip")
-                ),
+                )[:180],
                 "motivo": str(
                     clip.get("motivo", "")
-                )
+                )[:300]
             })
 
-        except Exception:
-
+        except (KeyError, TypeError, ValueError):
             continue
 
-    seleccionados = []
-
     validos.sort(
-        key=lambda x: x["inicio"]
+        key=lambda x: (
+            -(x["fin"] - x["inicio"]),
+            x["inicio"]
+        )
     )
+
+    seleccionados = []
 
     for clip in validos:
 
@@ -935,24 +842,87 @@ def validar_clips(resultado, duracion_video):
         )
 
         if not se_cruza:
-
             seleccionados.append(clip)
 
         if len(seleccionados) == CANTIDAD_CLIPS:
             break
 
-    if not seleccionados:
+    seleccionados.sort(
+        key=lambda x: x["inicio"]
+    )
 
+    if len(seleccionados) < CANTIDAD_CLIPS:
         raise RuntimeError(
-            "No se encontraron momentos válidos."
+            f"La IA solo encontró {len(seleccionados)} momentos válidos. "
+            "Prueba con otro video o vuelve a intentarlo."
         )
 
     return seleccionados
 
 
-# ==========================================
-# CREAR CLIP VERTICAL
-# ==========================================
+# =========================================================
+# SEGUIMIENTO FACIAL
+# =========================================================
+
+def cargar_detector_rostros():
+
+    ruta = (
+        cv2.data.haarcascades
+        + "haarcascade_frontalface_default.xml"
+    )
+
+    detector = cv2.CascadeClassifier(ruta)
+
+    if detector.empty():
+        raise RuntimeError(
+            "No se pudo cargar el detector facial de OpenCV."
+        )
+
+    return detector
+
+
+def detectar_centro_rostro(frame, detector):
+
+    escala = FACE_DETECT_SCALE
+
+    reducido = cv2.resize(
+        frame,
+        None,
+        fx=escala,
+        fy=escala,
+        interpolation=cv2.INTER_AREA
+    )
+
+    gris = cv2.cvtColor(
+        reducido,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    rostros = detector.detectMultiScale(
+        gris,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(30, 30),
+        flags=cv2.CASCADE_SCALE_IMAGE
+    )
+
+    if len(rostros) == 0:
+        return None
+
+    x, y, w, h = max(
+        rostros,
+        key=lambda r: r[2] * r[3]
+    )
+
+    cx = (x + w / 2) / escala
+    cy = (y + h / 2) / escala
+
+    return (cx, cy, w / escala, h / escala)
+
+
+# =========================================================
+# CREAR CLIP VERTICAL 9:16
+# =========================================================
 
 def crear_clip(video, clip, carpeta, numero):
 
@@ -961,73 +931,233 @@ def crear_clip(video, clip, carpeta, numero):
         f"clip_{numero}.mp4"
     )
 
-    duracion = (
-        clip["fin"] - clip["inicio"]
+    temporal_sin_audio = os.path.join(
+        carpeta,
+        f"clip_{numero}_silent.mp4"
     )
 
-    comando = [
+    temporal_audio = os.path.join(
+        carpeta,
+        f"clip_{numero}_audio.m4a"
+    )
+
+    cap = cv2.VideoCapture(video)
+
+    if not cap.isOpened():
+        raise RuntimeError(
+            "OpenCV no pudo abrir el video."
+        )
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    if not fps or fps < 1 or fps > 120:
+        fps = 30.0
+
+    ancho = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    alto = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    if ancho <= 0 or alto <= 0:
+        cap.release()
+        raise RuntimeError(
+            "No se pudieron leer las dimensiones del video."
+        )
+
+    inicio = float(clip["inicio"])
+    fin = float(clip["fin"])
+    duracion = fin - inicio
+
+    crop_h = alto
+    crop_w = int(round(crop_h * 9 / 16))
+
+    if crop_w > ancho:
+        crop_w = ancho
+        crop_h = int(round(crop_w * 16 / 9))
+
+    crop_w = max(2, crop_w - crop_w % 2)
+    crop_h = max(2, crop_h - crop_h % 2)
+
+    detector = cargar_detector_rostros()
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+    writer = cv2.VideoWriter(
+        temporal_sin_audio,
+        fourcc,
+        fps,
+        (1080, 1920)
+    )
+
+    if not writer.isOpened():
+        cap.release()
+        raise RuntimeError(
+            "No se pudo crear el video vertical temporal."
+        )
+
+    frame_inicio = int(inicio * fps)
+    frame_fin = int(fin * fps)
+
+    cap.set(
+        cv2.CAP_PROP_POS_FRAMES,
+        frame_inicio
+    )
+
+    centro_x = ancho / 2
+    centro_y = alto / 2
+
+    contador = 0
+    total_frames = max(
+        1,
+        frame_fin - frame_inicio
+    )
+
+    try:
+
+        while contador < total_frames:
+
+            ok, frame = cap.read()
+
+            if not ok:
+                break
+
+            if contador % FACE_SAMPLE_EVERY == 0:
+
+                rostro = detectar_centro_rostro(
+                    frame,
+                    detector
+                )
+
+                if rostro:
+
+                    rx, ry, rw, rh = rostro
+
+                    objetivo_x = rx
+                    objetivo_y = ry - rh * 0.12
+
+                    centro_x = (
+                        FACE_SMOOTHING * centro_x
+                        + (1 - FACE_SMOOTHING) * objetivo_x
+                    )
+
+                    centro_y = (
+                        FACE_SMOOTHING * centro_y
+                        + (1 - FACE_SMOOTHING) * objetivo_y
+                    )
+
+            x1 = int(round(centro_x - crop_w / 2))
+            y1 = int(round(centro_y - crop_h / 2))
+
+            x1 = max(0, min(x1, ancho - crop_w))
+            y1 = max(0, min(y1, alto - crop_h))
+
+            recorte = frame[
+                y1:y1 + crop_h,
+                x1:x1 + crop_w
+            ]
+
+            if recorte.size == 0:
+                contador += 1
+                continue
+
+            vertical = cv2.resize(
+                recorte,
+                (1080, 1920),
+                interpolation=cv2.INTER_AREA
+            )
+
+            writer.write(vertical)
+            contador += 1
+
+    finally:
+
+        cap.release()
+        writer.release()
+
+    if contador < int(total_frames * 0.90):
+        raise RuntimeError(
+            "No se pudieron procesar suficientes fotogramas del clip."
+        )
+
+    ejecutar_comando([
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "error",
-        "-nostats",
         "-y",
-
-        "-ss",
-        str(clip["inicio"]),
-
-        "-i",
-        video,
-
-        "-t",
-        str(duracion),
-
-        "-vf",
-        "crop='trunc(ih*9/16/2)*2':ih,scale=1080:1920",
-
-        "-threads", "2",
-        "-r", "30",
-
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "28",
-
+        "-ss", str(inicio),
+        "-i", video,
+        "-t", str(duracion),
+        "-vn",
         "-c:a", "aac",
         "-b:a", "128k",
+        temporal_audio
+    ], 600)
 
+    ejecutar_comando([
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-y",
+        "-i", temporal_sin_audio,
+        "-i", temporal_audio,
+        "-map", "0:v:0",
+        "-map", "1:a:0?",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "27",
+        "-pix_fmt", "yuv420p",
+        "-r", "30",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-shortest",
         "-movflags", "+faststart",
-
-        "-maxrate", "2500k",
-        "-bufsize", "5000k",
-
         salida
-    ]
+    ], 1200)
 
-    ejecutar_comando(
-        comando,
-        900
-    )
+    for temporal in (
+        temporal_sin_audio,
+        temporal_audio
+    ):
+
+        try:
+            if os.path.exists(temporal):
+                os.remove(temporal)
+        except OSError:
+            pass
 
     if not os.path.exists(salida):
-
         raise RuntimeError(
-            "FFmpeg no creó el clip."
+            "FFmpeg no creó el clip final."
         )
 
     if os.path.getsize(salida) > MAX_CLIP_BYTES:
 
-        comando[comando.index("-crf") + 1] = "32"
+        comprimido = os.path.join(
+            carpeta,
+            f"clip_{numero}_compressed.mp4"
+        )
 
-        comando[
-            comando.index("-maxrate") + 1
-        ] = "1500k"
+        ejecutar_comando([
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-y",
+            "-i", salida,
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "32",
+            "-maxrate", "1400k",
+            "-bufsize", "2800k",
+            "-c:a", "aac",
+            "-b:a", "96k",
+            "-movflags", "+faststart",
+            comprimido
+        ], 900)
 
-        ejecutar_comando(
-            comando,
-            900
+        os.replace(
+            comprimido,
+            salida
         )
 
     if os.path.getsize(salida) > MAX_CLIP_BYTES:
-
         raise RuntimeError(
             "El clip supera el límite de 45 MB."
         )
@@ -1035,17 +1165,19 @@ def crear_clip(video, clip, carpeta, numero):
     return salida
 
 
-# ==========================================
-# TELEGRAM: INICIO
-# ==========================================
+# =========================================================
+# TELEGRAM
+# =========================================================
 
 async def start(update, context):
 
     await update.message.reply_text(
         "🎬 ¡Bienvenido a CLIPMASTER AI!\n\n"
-        "Envíame un enlace público de YouTube.\n\n"
-        "Prepararé hasta 3 clips verticales 9:16 "
-        "de entre 30 y 60 segundos.\n\n"
+        "Envíame un enlace público de YouTube.\n"
+        "Prepararé 3 clips verticales 9:16 "
+        "de entre 30 y 60 segundos.\n"
+        "El recorte intentará seguir el rostro "
+        "más grande que detecte.\n\n"
         "Límite: videos de hasta 60 minutos."
     )
 
@@ -1058,9 +1190,9 @@ async def ayuda(update, context):
     )
 
 
-# ==========================================
-# ENVIAR VIDEO CON REINTENTOS
-# ==========================================
+# =========================================================
+# ENVIAR VIDEO
+# =========================================================
 
 async def enviar_video(update, ruta, caption):
 
@@ -1087,7 +1219,7 @@ async def enviar_video(update, ruta, caption):
         except (TimedOut, NetworkError):
 
             logger.warning(
-                "Envio a Telegram fallo (intento %s/%s).",
+                "Envío a Telegram falló (intento %s/%s).",
                 intento,
                 maximo
             )
@@ -1098,9 +1230,9 @@ async def enviar_video(update, ruta, caption):
             await asyncio.sleep(5)
 
 
-# ==========================================
+# =========================================================
 # PROCESAR VIDEO
-# ==========================================
+# =========================================================
 
 async def procesar_video(update, context):
 
@@ -1126,6 +1258,17 @@ async def procesar_video(update, context):
         )
 
         return
+
+    if context.chat_data.get("procesando"):
+
+        await update.message.reply_text(
+            "⏳ Ya estoy procesando un video en este chat. "
+            "Espera a que termine."
+        )
+
+        return
+
+    context.chat_data["procesando"] = True
 
     carpeta = tempfile.mkdtemp(
         prefix="clipmaster_"
@@ -1171,7 +1314,8 @@ async def procesar_video(update, context):
 
         await update.message.reply_text(
             f"✂️ Encontré {len(clips)} momentos.\n"
-            "Preparando clips verticales..."
+            "Preparando 3 clips verticales "
+            "con seguimiento facial..."
         )
 
         enviados = 0
@@ -1180,6 +1324,10 @@ async def procesar_video(update, context):
             clips,
             start=1
         ):
+
+            await update.message.reply_text(
+                f"🎞️ Preparando clip {numero} de {CANTIDAD_CLIPS}..."
+            )
 
             ruta = await asyncio.to_thread(
                 crear_clip,
@@ -1193,10 +1341,15 @@ async def procesar_video(update, context):
                 f"🎬 CLIP {numero}\n"
                 f"{clip['titulo']}\n"
                 f"⏱ {int(clip['inicio'])}s - "
-                f"{int(clip['fin'])}s"
+                f"{int(clip['fin'])}s\n"
+                f"💡 {clip['motivo']}"
             )
 
-            await enviar_video(update, ruta, caption)
+            await enviar_video(
+                update,
+                ruta,
+                caption
+            )
 
             enviados += 1
 
@@ -1207,9 +1360,7 @@ async def procesar_video(update, context):
 
     except subprocess.TimeoutExpired:
 
-        logger.exception(
-            "Tiempo agotado."
-        )
+        logger.exception("Tiempo agotado.")
 
         await update.message.reply_text(
             "⏳ La operación tardó demasiado. "
@@ -1236,10 +1387,12 @@ async def procesar_video(update, context):
             ignore_errors=True
         )
 
+        context.chat_data["procesando"] = False
 
-# ==========================================
+
+# =========================================================
 # ERRORES
-# ==========================================
+# =========================================================
 
 async def error_handler(update, context):
 
@@ -1249,30 +1402,28 @@ async def error_handler(update, context):
     )
 
 
-# ==========================================
+# =========================================================
 # INICIAR BOT
-# ==========================================
+# =========================================================
 
 def main():
 
     if not TOKEN:
-
         raise RuntimeError(
             "Falta BOT_TOKEN en Railway."
         )
 
     if not API_KEY:
-
         raise RuntimeError(
             "Falta TWELVELABS_API_KEY en Railway."
         )
 
     if TUNELIO_API_KEY:
-
-        logger.info("Descarga mediante Tunelio activada.")
+        logger.info(
+            "Descarga mediante Tunelio activada."
+        )
 
     else:
-
         logger.warning(
             "Sin TUNELIO_API_KEY: se usará yt-dlp."
         )
@@ -1317,5 +1468,4 @@ def main():
 
 
 if __name__ == "__main__":
-
     main()
