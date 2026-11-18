@@ -137,7 +137,10 @@ def ejecutar_comando(comando, timeout=900):
             or "Error desconocido"
         )
 
-        raise RuntimeError(detalle[-5000:])
+        raise RuntimeError(
+            detalle[-4000:]
+            + f"\n[codigo de salida: {proceso.returncode}]"
+        )
 
     return proceso.stdout
 
@@ -963,6 +966,9 @@ def crear_clip(video, clip, carpeta, numero):
 
     comando = [
         "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-nostats",
         "-y",
 
         "-ss",
@@ -975,8 +981,9 @@ def crear_clip(video, clip, carpeta, numero):
         str(duracion),
 
         "-vf",
-        "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+        "crop='trunc(ih*9/16/2)*2':ih,scale=1080:1920",
 
+        "-threads", "2",
         "-r", "30",
 
         "-c:v", "libx264",
