@@ -1,5 +1,5 @@
 python-telegram-bot==21.10
-yt-dlp[default]
+yt-dlp[default,curl-cffi]
 bgutil-ytdlp-pot-provider
 twelvelabs
-opencv-python-headless
+streamlink>=7.5,<9
