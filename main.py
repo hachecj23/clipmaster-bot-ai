@@ -358,46 +358,163 @@ def tunelio_pedir(ruta, parametros, reintentos=3):
 
 def bajar_archivo(enlace, destino, tamano_esperado=None):
 
-    peticion = urllib.request.Request(
-        enlace,
-        headers={"User-Agent": "ClipmasterBot/1.0"}
-    )
+    MAX_INTENTOS = 5
+    TAMANO_BLOQUE = 1024 * 1024
 
-    inicio = time.time()
-    total = 0
+    for intento in range(1, MAX_INTENTOS + 1):
 
-    try:
+        total = (
+            os.path.getsize(destino)
+            if os.path.exists(destino)
+            else 0
+        )
 
-        with urllib.request.urlopen(
-            peticion,
-            timeout=60
-        ) as respuesta, open(destino, "wb") as archivo:
+        inicio = time.time()
 
-            while True:
+        try:
+            headers = {
+                "User-Agent": "ClipmasterBot/1.0"
+            }
 
-                bloque = respuesta.read(1024 * 1024)
+            if total > 0:
+                headers["Range"] = f"bytes={total}-"
 
-                if not bloque:
-                    break
+            peticion = urllib.request.Request(
+                enlace,
+                headers=headers
+            )
 
-                total += len(bloque)
+            with urllib.request.urlopen(
+                peticion,
+                timeout=120
+            ) as respuesta:
 
-                if total > MAX_VIDEO_BYTES:
-                    raise RuntimeError("El video supera los 2 GB.")
+                estado = getattr(
+                    respuesta,
+                    "status",
+                    respuesta.getcode()
+                )
 
-                if time.time() - inicio > TIEMPO_DESCARGA:
-                    raise RuntimeError("La descarga tardó demasiado.")
+                # Comprobar si el servidor acepta reanudar.
+                if total > 0 and estado == 206:
 
-                archivo.write(bloque)
+                    content_range = respuesta.headers.get(
+                        "Content-Range",
+                        ""
+                    )
 
-    except urllib.error.HTTPError as error:
-        raise ErrorDescargaHttp(error.code) from None
+                    coincidencia = re.match(
+                        r"bytes\s+(\d+)-",
+                        content_range,
+                        re.IGNORECASE
+                    )
 
-    if total == 0:
-        raise RuntimeError("Tunelio entregó un archivo vacío.")
+                    if coincidencia and int(
+                        coincidencia.group(1)
+                    ) == total:
+                        modo = "ab"
+                    else:
+                        raise RuntimeError(
+                            "Tunelio devolvió un rango de descarga incorrecto."
+                        )
 
-    if tamano_esperado and total < tamano_esperado * 0.9:
-        raise RuntimeError("La descarga quedó incompleta.")
+                else:
+                    # Si no admite Range, comenzar desde cero.
+                    total = 0
+                    modo = "wb"
+
+                with open(destino, modo) as archivo:
+
+                    while True:
+
+                        bloque = respuesta.read(
+                            TAMANO_BLOQUE
+                        )
+
+                        if not bloque:
+                            break
+
+                        archivo.write(bloque)
+                        total += len(bloque)
+
+                        if total > MAX_VIDEO_BYTES:
+                            raise RuntimeError(
+                                "El video supera los 2 GB."
+                            )
+
+                        if time.time() - inicio > TIEMPO_DESCARGA:
+                            raise RuntimeError(
+                                "La descarga tardó demasiado."
+                            )
+
+            if total == 0:
+                raise RuntimeError(
+                    "Tunelio entregó un archivo vacío."
+                )
+
+            if (
+                tamano_esperado
+                and total < tamano_esperado * 0.9
+            ):
+                raise ConnectionError(
+                    "La descarga quedó incompleta."
+                )
+
+            logger.info(
+                "Descarga completada: %.2f MB",
+                total / (1024 * 1024)
+            )
+
+            return
+
+        except urllib.error.HTTPError as error:
+
+            if error.code == 416 and total > 0:
+
+                if (
+                    not tamano_esperado
+                    or total >= tamano_esperado * 0.9
+                ):
+                    logger.info(
+                        "El archivo parece estar completo."
+                    )
+                    return
+
+            if intento == MAX_INTENTOS:
+                raise ErrorDescargaHttp(
+                    error.code
+                ) from None
+
+            logger.warning(
+                "Error HTTP %s. Intento %s/%s.",
+                error.code,
+                intento,
+                MAX_INTENTOS
+            )
+
+        except (
+            urllib.error.URLError,
+            ConnectionResetError,
+            TimeoutError,
+            OSError,
+            ConnectionError
+        ) as error:
+
+            if intento == MAX_INTENTOS:
+                raise RuntimeError(
+                    "Tunelio interrumpió la descarga después "
+                    "de 5 intentos. Último error: "
+                    + str(error)
+                ) from None
+
+            logger.warning(
+                "Descarga interrumpida. Intento %s/%s: %s",
+                intento,
+                MAX_INTENTOS,
+                error
+            )
+
+        time.sleep(3 * intento)
 
 
 def descargar_video_tunelio(url, carpeta):
