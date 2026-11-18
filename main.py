@@ -1951,17 +1951,34 @@ async def capturar_directo(update, context, url):
     ]
 
     stream = ffmpeg = None
+    pipe_read = pipe_write = None
     stop_event = asyncio.Event()
     DIRECTOS_ACTIVOS[chat_id] = {"stop": stop_event, "stream": None, "ffmpeg": None, "task": asyncio.current_task()}
     procesados = set()
     numero = 0
     try:
-        stream = await asyncio.create_subprocess_exec(*stream_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-        ffmpeg = await asyncio.create_subprocess_exec(*ffmpeg_cmd, stdin=stream.stdout, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        # No pasar StreamReader (asyncio.PIPE) como stdin de otro subproceso:
+        # StreamReader no tiene fileno(). Usamos un pipe real del sistema operativo.
+        pipe_read, pipe_write = os.pipe()
+        stream = await asyncio.create_subprocess_exec(
+            *stream_cmd,
+            stdout=pipe_write,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        os.close(pipe_write)
+        pipe_write = None
+
+        ffmpeg = await asyncio.create_subprocess_exec(
+            *ffmpeg_cmd,
+            stdin=pipe_read,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        os.close(pipe_read)
+        pipe_read = None
+
         DIRECTOS_ACTIVOS[chat_id]["stream"] = stream
         DIRECTOS_ACTIVOS[chat_id]["ffmpeg"] = ffmpeg
-        if stream.stdout:
-            stream.stdout.close()
 
         while not stop_event.is_set():
             await asyncio.sleep(8)
@@ -2007,6 +2024,13 @@ async def capturar_directo(update, context, url):
         logger.exception("Fallo en captura Kick en vivo")
         await update.message.reply_text("❌ No pude mantener la captura del directo.\n" + str(e)[-1200:])
     finally:
+        # Cerrar descriptores que sigan abiertos si el arranque falló a mitad.
+        for fd in (pipe_read, pipe_write):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
         # Cerrar primero Streamlink para que FFmpeg finalice el último segmento.
         for proc in (stream, ffmpeg):
             if proc and proc.returncode is None:
