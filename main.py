@@ -213,6 +213,22 @@ def es_canal_kick(url):
         return False
 
 
+def es_enlace_directo_youtube(url):
+    """Acepta enlaces/canales de YouTube para que Streamlink valide si están en vivo.
+
+    YouTube no siempre expone el estado LIVE en la URL; por eso la comprobación
+    definitiva se hace al intentar abrir el stream.
+    """
+    try:
+        return validar_youtube(url)
+    except Exception:
+        return False
+
+
+def es_objetivo_directo(url):
+    return es_canal_kick(url) or es_enlace_directo_youtube(url)
+
+
 def es_enlace_kick(url):
 
     try:
@@ -1899,7 +1915,7 @@ def crear_clip(video, clip, carpeta, numero):
 
 
 # ==========================================
-# KICK EN VIVO: CAPTURA POR BLOQUES
+# DIRECTOS KICK Y YOUTUBE: CAPTURA POR BLOQUES
 # ==========================================
 
 # Una tarea activa por chat. Los procesos se guardan para poder detenerlos.
@@ -1923,6 +1939,7 @@ def procesar_bloque_directo(video, carpeta, numero):
 
 
 async def capturar_directo(update, context, url):
+    plataforma = "KICK" if es_canal_kick(url) else "YOUTUBE"
     chat_id = update.effective_chat.id
     if chat_id in DIRECTOS_ACTIVOS:
         await update.message.reply_text("⚠️ Ya hay una captura activa en este chat. Usa /detener para finalizarla.")
@@ -1932,13 +1949,15 @@ async def capturar_directo(update, context, url):
     lista = os.path.join(carpeta, "bloques.csv")
     patron = os.path.join(carpeta, "bloque_%05d.ts")
     await update.message.reply_text(
-        "🔴 Iniciando captura del directo de Kick.\n"
+        f"🔴 Iniciando captura del directo de {plataforma}.\n"
         f"Analizaré bloques de {LIVE_SEGMENT_SECONDS // 60} minutos y enviaré los mejores clips mientras la transmisión continúa.\n"
+        "Si el enlace no corresponde a una transmisión pública en vivo, te avisaré.\n"
         "Usa /detener para terminar."
     )
 
+    # Streamlink selecciona el plugin según el dominio (Kick o YouTube).
     stream_cmd = ["streamlink", "--stdout", url, "best"]
-    if KICK_PROXY:
+    if plataforma == "KICK" and KICK_PROXY:
         stream_cmd[1:1] = ["--http-proxy", KICK_PROXY]
 
     ffmpeg_cmd = [
@@ -2007,7 +2026,7 @@ async def capturar_directo(update, context, url):
                 try:
                     resultados = await asyncio.to_thread(procesar_bloque_directo, ruta, carpeta, numero)
                     for j, (clip_path, clip) in enumerate(resultados, 1):
-                        await enviar_video(update, clip_path, f"🔴 KICK EN VIVO · CLIP {j}\n{clip['titulo']}\n{clip.get('motivo','')}")
+                        await enviar_video(update, clip_path, f"🔴 {plataforma} EN VIVO · CLIP {j}\n{clip['titulo']}\n{clip.get('motivo','')}")
                     if not resultados:
                         await update.message.reply_text("No encontré un momento de 30–60 segundos en este bloque. Seguiré analizando el directo.")
                 except Exception as e:
@@ -2021,7 +2040,7 @@ async def capturar_directo(update, context, url):
 
         await update.message.reply_text("⏹️ Solicitud de detención recibida. Cerrando la captura...")
     except Exception as e:
-        logger.exception("Fallo en captura Kick en vivo")
+        logger.exception("Fallo en captura %s en vivo", plataforma)
         await update.message.reply_text("❌ No pude mantener la captura del directo.\n" + str(e)[-1200:])
     finally:
         # Cerrar descriptores que sigan abiertos si el arranque falló a mitad.
@@ -2053,11 +2072,18 @@ async def capturar_directo(update, context, url):
 async def comando_directo(update, context):
     texto = " ".join(context.args).strip()
     if not texto:
-        await update.message.reply_text("Uso: /directo https://kick.com/nombre_del_canal")
+        await update.message.reply_text(
+            "Uso: /directo ENLACE_DEL_DIRECTO\n"
+            "Kick: /directo https://kick.com/nombre_del_canal\n"
+            "YouTube: /directo https://www.youtube.com/@canal/live"
+        )
         return
     url = texto.split()[0]
-    if not es_canal_kick(url):
-        await update.message.reply_text("Envíame el enlace público de un canal, por ejemplo: /directo https://kick.com/nombre_del_canal")
+    if not es_objetivo_directo(url):
+        await update.message.reply_text(
+            "Envíame un enlace público de un canal de Kick o YouTube. "
+            "Ejemplo: /directo https://www.youtube.com/@canal/live"
+        )
         return
     await capturar_directo(update, context, url)
 
@@ -2081,7 +2107,7 @@ async def start(update, context):
         "🎬 ¡Bienvenido a CLIPMASTER AI!\n\n"
         "Envíame un enlace público de YouTube, "
         "un VOD o clip de Kick.\n"
-        "Para capturar un directo: /directo https://kick.com/canal\n"
+        "Para capturar directos de Kick o YouTube: /directo ENLACE\n"
         "Para detenerlo: /detener.\n\n"
         "Prepararé hasta 3 clips verticales 9:16 "
         "de entre 30 y 60 segundos.\n\n"
@@ -2095,8 +2121,8 @@ async def ayuda(update, context):
 
     await update.message.reply_text(
         "Envíame un enlace de YouTube, un VOD/clip de Kick "
-        "o usa /directo https://kick.com/canal. "
-        "Usa /detener para parar una captura en vivo."
+        "o usa /directo ENLACE para capturar un directo público de Kick o YouTube. "
+        "Usa /detener para parar la captura."
     )
 
 
