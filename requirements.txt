@@ -2,4 +2,5 @@ python-telegram-bot==21.10
 yt-dlp[default,curl-cffi]
 bgutil-ytdlp-pot-provider
 twelvelabs
-streamlink>=7.5,<9
+streamlink>=8.1.2,<9
+
