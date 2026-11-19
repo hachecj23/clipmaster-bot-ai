@@ -1930,7 +1930,7 @@ async def capturar_directo(update, context, url):
 
     carpeta = tempfile.mkdtemp(prefix="clipmaster_live_")
     lista = os.path.join(carpeta, "bloques.csv")
-    patron = os.path.join(carpeta, "bloque_%05d.mp4")
+    patron = os.path.join(carpeta, "bloque_%05d.ts")
     await update.message.reply_text(
         "🔴 Iniciando captura del directo de Kick.\n"
         f"Analizaré bloques de {LIVE_SEGMENT_SECONDS // 60} minutos y enviaré los mejores clips mientras la transmisión continúa.\n"
@@ -1945,7 +1945,7 @@ async def capturar_directo(update, context, url):
         "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
         "-i", "pipe:0", "-map", "0", "-c", "copy",
         "-f", "segment", "-segment_time", str(LIVE_SEGMENT_SECONDS),
-        "-reset_timestamps", "1", "-segment_format", "mp4",
+        "-reset_timestamps", "1", "-segment_format", "mpegts",
         "-segment_list", lista, "-segment_list_type", "csv",
         patron
     ]
