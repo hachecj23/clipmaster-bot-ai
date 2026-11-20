@@ -1037,18 +1037,17 @@ def analizar_video(asset_id, duracion):
     prompt = f"""
 Analiza el video completo.
 
-Encuentra exactamente 3 momentos interesantes
-que puedan convertirse en clips virales.
-
+Encuentra exactamente 3 momentos interesantes que puedan convertirse en clips virales.
 Cada clip debe durar entre 30 y 60 segundos.
-
-Busca momentos:
-- Impactantes.
-- Emocionantes.
-- Sorprendentes.
-- Graciosos.
-- Con frases interesantes.
-- Que atrapen la atención.
+Evalúa cada momento con una puntuación VIRAL de 0 a 100 usando estos criterios:
+- impacto emocional (0-20)
+- sorpresa/acontecimiento inesperado (0-20)
+- frase potente o polémica (0-15)
+- humor (0-15)
+- interés y retención (0-15)
+- contexto comprensible sin depender del resto del video (0-15)
+Busca reacciones, tensión con desenlace, revelaciones, humor, frases memorables y cambios emocionales.
+Prioriza puntuaciones altas, evita momentos repetidos y no inventes escenas.
 
 El video dura {duracion} segundos.
 
@@ -1060,7 +1059,9 @@ Devuelve solamente JSON válido:
    "inicio": 10,
    "fin": 50,
    "titulo": "Título del clip",
-   "motivo": "Motivo de selección"
+   "motivo": "Motivo de selección",
+   "score": 88,
+   "score_detalle": {{"impacto": 18, "sorpresa": 17, "frase": 13, "humor": 12, "retencion": 14, "contexto": 14}}
   }}
  ]
 }}
@@ -1174,8 +1175,8 @@ def analizar_con_gemini(video, duracion):
         file=video,
         config={"mime_type": mime or "video/mp4"}
     )
+    nombre = getattr(archivo, "name", None)
     try:
-        nombre = getattr(archivo, "name", None)
         if not nombre:
             raise RuntimeError("Gemini no devolvió el identificador del archivo.")
         inicio_espera = time.time()
@@ -1191,7 +1192,7 @@ def analizar_con_gemini(video, duracion):
         else:
             raise TimeoutError("Gemini tardó demasiado en procesar el video.")
 
-        prompt = f"""Analiza el video completo, de {duracion:.2f} segundos. Encuentra exactamente {CANTIDAD_CLIPS} momentos atractivos para TikTok, Reels y Shorts. Cada clip debe durar entre {DURACION_MINIMA} y {DURACION_MAXIMA} segundos. Prioriza momentos impactantes, sorprendentes, graciosos, emocionales, reacciones y frases memorables. No inventes escenas. Usa tiempos reales en segundos, no excedas la duración, evita solapamientos y devuelve solamente JSON válido con este formato: {{\"clips\":[{{\"inicio\":10.0,\"fin\":55.0,\"titulo\":\"Título\",\"motivo\":\"Motivo\"}}]}}"""
+        prompt = f"""Analiza el video completo, de {duracion:.2f} segundos. Encuentra exactamente {CANTIDAD_CLIPS} momentos atractivos para TikTok, Reels y Shorts. Cada clip debe durar entre {DURACION_MINIMA} y {DURACION_MAXIMA} segundos. Puntúa cada momento de 0 a 100: impacto emocional (20), sorpresa (20), frase potente (15), humor (15), interés/retención (15), contexto autónomo (15). Prioriza reacciones, revelaciones, tensión con desenlace, humor, frases memorables y cambios emocionales. No inventes escenas; usa tiempos reales, no excedas duración, evita solapamientos y devuelve solo JSON válido con este formato: {{"clips":[{{"inicio":10.0,"fin":55.0,"titulo":"Título","motivo":"Motivo","score":88,"score_detalle":{{"impacto":18,"sorpresa":17,"frase":13,"humor":12,"retencion":14,"contexto":14}}}}]}}"""
         respuesta = api.models.generate_content(
             model=GEMINI_MODEL,
             contents=[archivo, prompt],
@@ -1280,6 +1281,37 @@ def extraer_json(texto):
 
 
 # ==========================================
+# VIRAL ENGINE: CLASIFICACION DE MOMENTOS
+# ==========================================
+def clasificar_score_viral(score):
+    try:
+        score = max(0, min(100, int(float(score))))
+    except (TypeError, ValueError):
+        score = 0
+    if score >= 85:
+        return "🔥 VIRAL"
+    if score >= 70:
+        return "🟢 MUY BUENO"
+    if score >= 55:
+        return "🟡 INTERESANTE"
+    return "⚪ BAJA PRIORIDAD"
+
+
+def normalizar_score_detalle(detalle):
+    """Normaliza desglose y evita valores fuera de los máximos por criterio."""
+    limites = {"impacto": 20, "sorpresa": 20, "frase": 15,
+              "humor": 15, "retencion": 15, "contexto": 15}
+    if not isinstance(detalle, dict):
+        return {}
+    salida = {}
+    for clave, maximo in limites.items():
+        try:
+            salida[clave] = max(0, min(maximo, int(float(detalle.get(clave, 0)))))
+        except (TypeError, ValueError):
+            salida[clave] = 0
+    return salida
+
+# ==========================================
 # VALIDAR CLIPS
 # ==========================================
 
@@ -1315,15 +1347,19 @@ def validar_clips(resultado, duracion_video):
             if duracion > DURACION_MAXIMA:
                 continue
 
+            score = max(0, min(100, int(float(clip.get("score", 60)))))
+            detalle = normalizar_score_detalle(clip.get("score_detalle", {}))
+            # Si la IA devuelve desglose, se utiliza como control de consistencia.
+            if detalle and sum(detalle.values()) > 0:
+                score = min(100, sum(detalle.values()))
             validos.append({
                 "inicio": inicio,
                 "fin": fin,
-                "titulo": str(
-                    clip.get("titulo", "Clip")
-                ),
-                "motivo": str(
-                    clip.get("motivo", "")
-                )
+                "titulo": str(clip.get("titulo", "Clip"))[:160],
+                "motivo": str(clip.get("motivo", ""))[:500],
+                "score": score,
+                "score_detalle": detalle,
+                "nivel": clasificar_score_viral(score)
             })
 
         except Exception:
@@ -1332,8 +1368,10 @@ def validar_clips(resultado, duracion_video):
 
     seleccionados = []
 
+    # VIRAL ENGINE: elegir primero los clips con mayor puntuación.
     validos.sort(
-        key=lambda x: x["inicio"]
+        key=lambda x: x.get("score", 60),
+        reverse=True
     )
 
     for clip in validos:
@@ -2362,11 +2400,14 @@ async def procesar_video(update, context):
                 numero
             )
 
+            score = clip.get("score")
+            nivel = clip.get("nivel") or (clasificar_score_viral(score) if score is not None else "")
             caption = (
                 f"🎬 CLIP {numero}\n"
                 f"{clip['titulo']}\n"
-                f"⏱ {int(clip['inicio'])}s - "
-                f"{int(clip['fin'])}s"
+                + (f"{nivel} · {score}/100\n" if score is not None else "")
+                + (f"💡 {clip.get('motivo', '')}\n" if clip.get("motivo") else "")
+                + f"⏱ {int(clip['inicio'])}s - {int(clip['fin'])}s"
             )
 
             await enviar_video(update, ruta, caption)
