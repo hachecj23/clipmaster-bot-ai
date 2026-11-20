@@ -1,5 +1,6 @@
 python-telegram-bot==21.10
 yt-dlp[default,curl-cffi]
 bgutil-ytdlp-pot-provider
-google-genai>=1.0.0
+twelvelabs
 streamlink>=8.1.2,<9
+google-genai
