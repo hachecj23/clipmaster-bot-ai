@@ -56,6 +56,9 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "whisper-large-v3-turbo").strip()
 # Opcional: idioma del audio (es, en...). Vacio = detectar solo.
 GROQ_LANGUAGE = os.getenv("GROQ_LANGUAGE", "").strip()
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+LOCAL_WHISPER_MODEL = os.getenv("LOCAL_WHISPER_MODEL", "tiny").strip()
+LOCAL_WHISPER_DEVICE = os.getenv("LOCAL_WHISPER_DEVICE", "cpu").strip()
+LOCAL_WHISPER_COMPUTE = os.getenv("LOCAL_WHISPER_COMPUTE", "int8").strip()
 
 # Kick: proxy opcional (por si Kick bloquea la IP de Railway).
 # Formato: http://usuario:clave@servidor:puerto
@@ -957,14 +960,12 @@ def descargar_video(url, carpeta, rango=None):
 
         return descargar_video_kick(url, carpeta, rango)
 
+    # Tunelio es opcional; ante saldo agotado, error o timeout, usar yt-dlp.
     if TUNELIO_API_KEY:
-
-        return descargar_video_tunelio(url, carpeta)
-
-    logger.warning(
-        "Falta TUNELIO_API_KEY. Se usa yt-dlp."
-    )
-
+        try:
+            return descargar_video_tunelio(url, carpeta)
+        except Exception as error:
+            logger.warning("Tunelio falló (%s); fallback directo yt-dlp.", str(error)[:400])
     return descargar_video_ytdlp(url, carpeta)
 
 
@@ -1233,8 +1234,52 @@ def analizar_archivo_local(video, duracion):
     else:
         errores.append("Falta GEMINI_API_KEY.")
 
+    try:
+        logger.warning("Servicios remotos fallaron; se activa el análisis local sin API.")
+        return analizar_local_sin_ia(video, duracion)
+    except Exception as error:
+        errores.append("Análisis local: " + str(error)[-500:])
     raise RuntimeError("No se pudo analizar el video. " + " | ".join(errores))
 
+
+def transcribir_local(ruta_audio):
+    """Transcribe localmente con faster-whisper: no requiere API ni créditos."""
+    from faster_whisper import WhisperModel
+    modelo = WhisperModel(LOCAL_WHISPER_MODEL, device=LOCAL_WHISPER_DEVICE, compute_type=LOCAL_WHISPER_COMPUTE)
+    segmentos, _ = modelo.transcribe(ruta_audio, word_timestamps=True, vad_filter=True)
+    palabras = []
+    for seg in segmentos:
+        for w in (getattr(seg, "words", None) or []):
+            texto = (w.word or "").strip()
+            if texto:
+                palabras.append({"word": texto, "start": float(w.start), "end": float(w.end)})
+    return palabras
+
+def analizar_local_sin_ia(video, duracion):
+    """Fallback local por transcripción y puntuación heurística de ventanas de 45 s."""
+    audio = os.path.join(os.path.dirname(video), "local_analysis_audio.wav")
+    ejecutar_comando(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", video, "-vn", "-ac", "1", "-ar", "16000", audio], 600)
+    palabras = transcribir_local(audio)
+    try: os.remove(audio)
+    except OSError: pass
+    if not palabras:
+        raise RuntimeError("Whisper local no detectó voz en el video.")
+    claves = {"impacto": ["increíble", "imposible", "nunca", "jamás", "brutal", "wow", "dios"], "sorpresa": ["espera", "de repente", "sorprendente", "en serio", "enserio"], "humor": ["jaja", "haha", "jeje", "gracioso", "broma", "lol"], "frase": ["porque", "pero", "mira", "escucha", "verdad", "problema"]}
+    ventana = min(max(float(DURACION_MINIMA), 45.0), float(DURACION_MAXIMA), float(duracion))
+    candidatos=[]; inicio=0.0
+    while inicio+ventana <= duracion:
+        fin=inicio+ventana; pw=[p for p in palabras if inicio <= p["start"] < fin]; txt=" ".join(p["word"] for p in pw).lower()
+        if len(pw)>=8:
+            impacto=min(20,sum(txt.count(k) for k in claves["impacto"])*4); sorpresa=min(20,sum(txt.count(k) for k in claves["sorpresa"])*3)
+            humor=min(15,sum(txt.count(k) for k in claves["humor"])*5); frase=min(15,sum(txt.count(k) for k in claves["frase"])*2)
+            retencion=min(15,len(pw)/ventana*3); contexto=10 if len(txt.split())>35 else 5
+            score=min(100,int(impacto+sorpresa+humor+frase+retencion+contexto))
+            candidatos.append({"inicio":inicio,"fin":fin,"titulo":"Momento destacado (análisis local)","motivo":"Selección heurística basada en transcripción local; no equivale a análisis semántico remoto.","score":score,"score_detalle":{"impacto":impacto,"sorpresa":sorpresa,"frase":frase,"humor":humor,"retencion":retencion,"contexto":contexto}})
+        inicio += 12.0
+    if not candidatos and duracion >= DURACION_MINIMA:
+        fin=min(duracion,DURACION_MAXIMA); candidatos=[{"inicio":0.0,"fin":fin,"titulo":"Clip de respaldo local","motivo":"No se pudo puntuar la transcripción; segmento de respaldo.","score":55,"score_detalle":{}}]
+    if not candidatos: raise RuntimeError("Video demasiado corto para clips configurados.")
+    return {"clips":candidatos}
 
 # ==========================================
 # LEER RESPUESTA JSON
@@ -1717,10 +1762,6 @@ def escribir_ass(palabras, ruta):
 
 def preparar_subtitulos(video, clip, carpeta, numero):
 
-    if not GROQ_API_KEY:
-
-        return None
-
     try:
 
         duracion = clip["fin"] - clip["inicio"]
@@ -1747,7 +1788,14 @@ def preparar_subtitulos(video, clip, carpeta, numero):
             audio
         ], 300)
 
-        palabras = transcribir_groq(audio)
+        palabras = None
+        if GROQ_API_KEY:
+            try:
+                palabras = transcribir_groq(audio)
+            except Exception:
+                logger.warning("Groq falló; se usa Whisper local.", exc_info=True)
+        if not palabras:
+            palabras = transcribir_local(audio)
 
         if not palabras:
 
@@ -2481,15 +2529,12 @@ def main():
             "Falta BOT_TOKEN en Railway."
         )
 
-    if not API_KEY and not GEMINI_API_KEY:
-        raise RuntimeError(
-            "Configura TWELVELABS_API_KEY o GEMINI_API_KEY en Railway."
-        )
 
     if API_KEY:
-        logger.info("IA principal: TwelveLabs Pegasus 1.6.")
+        logger.info("TwelveLabs remoto opcional habilitado.")
     if GEMINI_API_KEY:
-        logger.info("IA de respaldo disponible: Gemini %s.", GEMINI_MODEL)
+        logger.info("Gemini remoto opcional habilitado: %s.", GEMINI_MODEL)
+    logger.info("Fallback local Whisper + scoring heurístico habilitado.")
 
     if TUNELIO_API_KEY:
 
@@ -2502,14 +2547,9 @@ def main():
         )
 
     if GROQ_API_KEY:
-
-        logger.info("Subtitulos con Groq activados.")
-
+        logger.info("Groq disponible; Whisper local queda como respaldo.")
     else:
-
-        logger.warning(
-            "Sin GROQ_API_KEY: los clips saldran sin subtitulos."
-        )
+        logger.info("Subtítulos autónomos: Whisper local habilitado (sin Groq).")
 
     app = (
         Application.builder()
