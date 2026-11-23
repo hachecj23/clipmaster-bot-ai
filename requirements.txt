@@ -4,3 +4,5 @@ bgutil-ytdlp-pot-provider
 twelvelabs
 streamlink>=8.1.2,<9
 google-genai
+faster-whisper>=1.1.0
+
