@@ -2100,6 +2100,95 @@ def crear_clip(video, clip, carpeta, numero):
 # Una tarea activa por chat. Los procesos se guardan para poder detenerlos.
 DIRECTOS_ACTIVOS = {}
 
+# Cola de recuperación persistente. En Railway, monta un Volume en /data para que
+# sobreviva a reinicios y define CLIPMASTER_DATA_DIR=/data.
+CLIPMASTER_DATA_DIR = os.getenv("CLIPMASTER_DATA_DIR", "/data" if os.path.isdir("/data") else "/tmp/clipmaster_data")
+LIVE_QUEUE_DIR = os.path.join(CLIPMASTER_DATA_DIR, "live_retry_queue")
+LIVE_QUEUE_RETRY_SECONDS = int(os.getenv("LIVE_QUEUE_RETRY_SECONDS", "180"))
+LIVE_QUEUE_MAX_ATTEMPTS = int(os.getenv("LIVE_QUEUE_MAX_ATTEMPTS", "12"))
+LIVE_QUEUE_WORKER_STARTED = False
+
+
+
+def _queue_paths():
+    os.makedirs(LIVE_QUEUE_DIR, exist_ok=True)
+    return LIVE_QUEUE_DIR
+
+
+
+def guardar_segmento_pendiente(video, chat_id, plataforma, numero):
+    """Persistir una copia de segmento fallido junto a metadatos para recuperación."""
+    try:
+        qdir = _queue_paths()
+        uid = f"{int(time.time())}_{chat_id}_{numero}_{os.path.basename(video)}"
+        destino = os.path.join(qdir, uid)
+        os.makedirs(destino, exist_ok=True)
+        video_dest = os.path.join(destino, "segmento.ts")
+        shutil.copy2(video, video_dest)
+        meta = {
+            "chat_id": int(chat_id), "plataforma": plataforma, "numero": int(numero),
+            "video": video_dest, "attempts": 0, "next_retry": 0,
+            "created": time.time(),
+        }
+        with open(os.path.join(destino, "job.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        logger.info("Segmento %s guardado en cola persistente", uid)
+        return destino
+    except Exception:
+        logger.exception("No se pudo persistir segmento fallido")
+        return None
+
+
+
+async def trabajador_recuperacion_live(application):
+    """Reintenta jobs guardados; evita que un reinicio pierda segmentos pendientes."""
+    logger.info("Worker de recuperación de directos iniciado: %s", LIVE_QUEUE_DIR)
+    while True:
+        try:
+            qdir = _queue_paths()
+            for jobdir in sorted(glob.glob(os.path.join(qdir, "*/job.json"))):
+                try:
+                    with open(jobdir, encoding="utf-8") as f:
+                        meta = json.load(f)
+                    if time.time() < float(meta.get("next_retry", 0)):
+                        continue
+                    video = meta.get("video", "")
+                    if not os.path.isfile(video):
+                        shutil.rmtree(os.path.dirname(jobdir), ignore_errors=True)
+                        continue
+                    attempts = int(meta.get("attempts", 0))
+                    if attempts >= LIVE_QUEUE_MAX_ATTEMPTS:
+                        continue
+                    meta["attempts"] = attempts + 1
+                    meta["next_retry"] = time.time() + LIVE_QUEUE_RETRY_SECONDS
+                    with open(jobdir, "w", encoding="utf-8") as f:
+                        json.dump(meta, f, ensure_ascii=False, indent=2)
+                    logger.info("Reintento de segmento pendiente %s/%s", meta["attempts"], LIVE_QUEUE_MAX_ATTEMPTS)
+                    clips = await asyncio.to_thread(procesar_bloque_directo, video, os.path.dirname(jobdir), int(meta.get("numero", 0)))
+                    if clips:
+                        for clip_path, clip in clips:
+                            caption = f"♻️ RECUPERADO · {meta.get('plataforma', 'DIRECTO')}\n{clip.get('titulo', 'Clip')}\n{clip.get('motivo', '')}"
+                            try:
+                                with open(clip_path, "rb") as f:
+                                    await application.bot.send_video(chat_id=int(meta["chat_id"]), video=f, caption=caption[:1024], supports_streaming=True)
+                            finally:
+                                try: os.remove(clip_path)
+                                except OSError: pass
+                    # Un análisis válido (clips o ninguno) completa el trabajo.
+                    shutil.rmtree(os.path.dirname(jobdir), ignore_errors=True)
+                except Exception as e:
+                    logger.warning("Job de recuperación falló: %s", str(e)[:500])
+        except Exception:
+            logger.exception("Error en worker de recuperación")
+        await asyncio.sleep(30)
+
+
+async def iniciar_worker_recuperacion(application):
+    global LIVE_QUEUE_WORKER_STARTED
+    if not LIVE_QUEUE_WORKER_STARTED:
+        LIVE_QUEUE_WORKER_STARTED = True
+        application.create_task(trabajador_recuperacion_live(application), name="clipmaster-live-recovery")
+
 
 def procesar_bloque_directo(video, carpeta, numero):
     """Analiza un bloque cerrado del directo y devuelve clips exportados."""
@@ -2152,6 +2241,7 @@ async def capturar_directo(update, context, url):
     stop_event = asyncio.Event()
     DIRECTOS_ACTIVOS[chat_id] = {"stop": stop_event, "stream": None, "ffmpeg": None, "task": asyncio.current_task()}
     procesados = set()
+    queued_live = {}
     numero = 0
     try:
         # No pasar StreamReader (asyncio.PIPE) como stdin de otro subproceso:
@@ -2217,9 +2307,16 @@ async def capturar_directo(update, context, url):
                         os.remove(ruta)
                     except OSError:
                         pass
+                    # Si había una copia de recuperación, retirarla para evitar duplicados.
+                    qjob = queued_live.pop(ruta, None)
+                    if qjob:
+                        shutil.rmtree(qjob, ignore_errors=True)
                 else:
                     # No borrar segmentos fallidos: los reintenta después de bloques nuevos.
                     procesados.discard(ruta)
+                    # Copia duradera: si Railway reinicia o la captura termina, el worker la recupera.
+                    if ruta not in queued_live:
+                        queued_live[ruta] = guardar_segmento_pendiente(ruta, chat_id, plataforma, numero)
                     await asyncio.sleep(2)
 
         await update.message.reply_text("⏹️ Solicitud de detención recibida. Cerrando la captura...")
@@ -2570,6 +2667,7 @@ def main():
         .write_timeout(60)
         .connect_timeout(30)
         .pool_timeout(30)
+        .post_init(iniciar_worker_recuperacion)
         .build()
     )
 
