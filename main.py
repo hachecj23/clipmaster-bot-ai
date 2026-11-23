@@ -1242,10 +1242,16 @@ def analizar_archivo_local(video, duracion):
     raise RuntimeError("No se pudo analizar el video. " + " | ".join(errores))
 
 
+_WHISPER_LOCAL_CACHE = None
+
 def transcribir_local(ruta_audio):
-    """Transcribe localmente con faster-whisper: no requiere API ni créditos."""
+    """Transcribe localmente con modelo reutilizado en RAM: no requiere API ni créditos."""
+    global _WHISPER_LOCAL_CACHE
     from faster_whisper import WhisperModel
-    modelo = WhisperModel(LOCAL_WHISPER_MODEL, device=LOCAL_WHISPER_DEVICE, compute_type=LOCAL_WHISPER_COMPUTE)
+    if _WHISPER_LOCAL_CACHE is None:
+        logger.info("Cargando Whisper local (%s) por primera vez.", LOCAL_WHISPER_MODEL)
+        _WHISPER_LOCAL_CACHE = WhisperModel(LOCAL_WHISPER_MODEL, device=LOCAL_WHISPER_DEVICE, compute_type=LOCAL_WHISPER_COMPUTE)
+    modelo = _WHISPER_LOCAL_CACHE
     segmentos, _ = modelo.transcribe(ruta_audio, word_timestamps=True, vad_filter=True)
     palabras = []
     for seg in segmentos:
@@ -2195,20 +2201,26 @@ async def capturar_directo(update, context, url):
                 procesados.add(ruta)
                 numero += 1
                 await update.message.reply_text(f"🧠 Analizando el bloque {numero} del directo...")
+                exito = False
                 try:
                     resultados = await asyncio.to_thread(procesar_bloque_directo, ruta, carpeta, numero)
                     for j, (clip_path, clip) in enumerate(resultados, 1):
                         await enviar_video(update, clip_path, f"🔴 {plataforma} EN VIVO · CLIP {j}\n{clip['titulo']}\n{clip.get('motivo','')}")
                     if not resultados:
                         await update.message.reply_text("No encontré un momento de 30–60 segundos en este bloque. Seguiré analizando el directo.")
+                    exito = True
                 except Exception as e:
                     logger.exception("Error procesando bloque del directo")
-                    await update.message.reply_text(f"⚠️ No pude procesar el bloque {numero}: {str(e)[-700:]}\nLa captura continuará.")
-                # El bloque fuente ya no es necesario después de exportar.
-                try:
-                    os.remove(ruta)
-                except OSError:
-                    pass
+                    await update.message.reply_text(f"⚠️ No pude procesar el bloque {numero}: {str(e)[-700:]}\nEl segmento se conserva para un reintento mientras siga activa la captura.")
+                if exito:
+                    try:
+                        os.remove(ruta)
+                    except OSError:
+                        pass
+                else:
+                    # No borrar segmentos fallidos: los reintenta después de bloques nuevos.
+                    procesados.discard(ruta)
+                    await asyncio.sleep(2)
 
         await update.message.reply_text("⏹️ Solicitud de detención recibida. Cerrando la captura...")
     except Exception as e:
