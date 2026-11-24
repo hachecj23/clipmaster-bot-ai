@@ -6,3 +6,6 @@ streamlink>=8.1.2,<9
 google-genai
 faster-whisper>=1.1.0
 
+
+# Compatibilidad faster-whisper 1.2.1 con PyAV (PyAV 19 removió metadata_errors)
+av==18.1.0
