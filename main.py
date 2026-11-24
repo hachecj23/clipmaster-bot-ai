@@ -1262,16 +1262,38 @@ def transcribir_local(ruta_audio):
     return palabras
 
 def analizar_local_sin_ia(video, duracion):
-    """Fallback local por transcripción y puntuación heurística de ventanas de 45 s."""
+    """Fallback local: intenta transcribir; si Whisper falla, crea clips de respaldo."""
     audio = os.path.join(os.path.dirname(video), "local_analysis_audio.wav")
-    ejecutar_comando(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", video, "-vn", "-ac", "1", "-ar", "16000", audio], 600)
-    palabras = transcribir_local(audio)
-    try: os.remove(audio)
-    except OSError: pass
-    if not palabras:
-        raise RuntimeError("Whisper local no detectó voz en el video.")
-    claves = {"impacto": ["increíble", "imposible", "nunca", "jamás", "brutal", "wow", "dios"], "sorpresa": ["espera", "de repente", "sorprendente", "en serio", "enserio"], "humor": ["jaja", "haha", "jeje", "gracioso", "broma", "lol"], "frase": ["porque", "pero", "mira", "escucha", "verdad", "problema"]}
+    palabras = []
+    error_whisper = None
+    try:
+        ejecutar_comando(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", video, "-vn", "-ac", "1", "-ar", "16000", audio], 600)
+        try:
+            palabras = transcribir_local(audio)
+        except Exception as error:
+            error_whisper = str(error)
+            logger.exception("Whisper local falló; se usarán clips de respaldo sin transcripción.")
+    finally:
+        try:
+            os.remove(audio)
+        except OSError:
+            pass
+
     ventana = min(max(float(DURACION_MINIMA), 45.0), float(DURACION_MAXIMA), float(duracion))
+    if not palabras:
+        if duracion < float(DURACION_MINIMA):
+            raise RuntimeError("Video demasiado corto para clips configurados.")
+        ventana = min(max(float(DURACION_MINIMA), 30.0), float(DURACION_MAXIMA), float(duracion))
+        max_clips = max(1, int(CANTIDAD_CLIPS)) if "CANTIDAD_CLIPS" in globals() else 3
+        posiciones = [0.0] if duracion <= ventana else [max(0.0, (duracion - ventana) * i / max(1, max_clips - 1)) for i in range(max_clips)]
+        candidatos = []
+        for inicio in posiciones:
+            fin = min(duracion, inicio + ventana)
+            candidatos.append({"inicio": inicio, "fin": fin, "titulo": "Clip de respaldo local", "motivo": "Whisper no pudo transcribir; clip seleccionado por distribución temporal para mantener el procesamiento.", "score": 55, "score_detalle": {"impacto": 10, "sorpresa": 10, "frase": 10, "humor": 5, "retencion": 10, "contexto": 10}})
+        return {"clips": candidatos}
+
+
+    claves = {"impacto": ["increíble", "imposible", "nunca", "jamás", "brutal", "wow", "dios"], "sorpresa": ["espera", "de repente", "sorprendente", "en serio", "enserio"], "humor": ["jaja", "haha", "jeje", "gracioso", "broma", "lol"], "frase": ["porque", "pero", "mira", "escucha", "verdad", "problema"]}
     candidatos=[]; inicio=0.0
     while inicio+ventana <= duracion:
         fin=inicio+ventana; pw=[p for p in palabras if inicio <= p["start"] < fin]; txt=" ".join(p["word"] for p in pw).lower()
